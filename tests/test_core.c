@@ -380,25 +380,61 @@ static void test_scan_of_self_produces_events(void)
     (void)_wremove(path);
 }
 
-int main(void)
-{
-    test_path_boundaries();
-    test_allow_roots();
-    test_module_list_and_ranges();
-    test_parent_directory();
-    test_image_name_matching();
-    test_wide_to_utf8();
-    test_log_chain_is_verifiable();
-    test_log_rotation();
-    test_policy_defaults();
-    test_open_process_uses_read_only_access();
-    test_scan_of_self_produces_events();
+typedef void (*AcCoreTestFunction)(void);
 
-    if (g_failures != 0) {
-        fprintf(stderr, "%d test(s) failed\n", g_failures);
-        return 1;
+typedef struct AcCoreTestCase {
+    const char *name;
+    AcCoreTestFunction function;
+} AcCoreTestCase;
+
+static const AcCoreTestCase g_test_cases[] = {
+    {"path_boundaries", test_path_boundaries},
+    {"allow_roots", test_allow_roots},
+    {"module_list_and_ranges", test_module_list_and_ranges},
+    {"parent_directory", test_parent_directory},
+    {"image_name_matching", test_image_name_matching},
+    {"wide_to_utf8", test_wide_to_utf8},
+    {"log_chain", test_log_chain_is_verifiable},
+    {"log_rotation", test_log_rotation},
+    {"policy_defaults", test_policy_defaults},
+    {"least_privilege_process_access", test_open_process_uses_read_only_access},
+    {"self_scan", test_scan_of_self_produces_events}
+};
+
+int main(int argc, char **argv)
+{
+    size_t index;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <test-case>\n", argv[0]);
+        return 2;
     }
 
-    puts("all core tests passed");
-    return 0;
+    for (index = 0;
+         index < sizeof(g_test_cases) / sizeof(g_test_cases[0]);
+         ++index) {
+        const AcCoreTestCase *test_case = &g_test_cases[index];
+
+        if (strcmp(argv[1], test_case->name) != 0) {
+            continue;
+        }
+
+        g_failures = 0;
+        test_case->function();
+
+        if (g_failures != 0) {
+            fprintf(
+                stderr,
+                "%d check(s) failed in core.%s\n",
+                g_failures,
+                test_case->name);
+            return 1;
+        }
+
+        printf("core.%s passed\n", test_case->name);
+        return 0;
+    }
+
+    fprintf(stderr, "unknown core test case: %s\n", argv[1]);
+    return 2;
 }

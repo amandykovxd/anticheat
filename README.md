@@ -109,6 +109,30 @@ build\Release\anticheat.exe
 The normal CI matrix builds and tests x64 and Win32 collectors. The portable
 core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
 
+### Automated test inventory
+
+Windows builds register 24 independent CTest cases: 10 portable algorithms,
+11 Windows collector/core behaviors, and 3 CLI contracts. Non-Windows builds
+register the 10 portable cases. Each entry runs one unique test function or
+contract so a failure identifies the affected subsystem directly.
+
+List the registered cases without executing them:
+
+```powershell
+ctest --preset windows-x64-release -N
+```
+
+Run one subsystem by label or one exact case by name:
+
+```powershell
+ctest --preset windows-x64-release -L portable
+ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
+```
+
+The available labels are `portable`, `core`, `cli`, and `windows`.
+The Windows CI matrix rejects a configuration that does not expose exactly 24
+independent cases.
+
 ## Build the kernel driver
 
 Install Visual Studio with Desktop C++ support and a matching Windows SDK/WDK

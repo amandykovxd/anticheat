@@ -240,24 +240,60 @@ static void test_dedup_fails_open_when_saturated(void)
     ac_dedup_free(&dedup);
 }
 
-int main(void)
-{
-    test_sha256_vectors();
-    test_sha256_streaming();
-    test_json_escaping();
-    test_fnv1a();
-    test_range_index();
-    test_range_index_merges_overlaps();
-    test_range_index_many_entries();
-    test_dedup_suppresses_repeats();
-    test_dedup_never_repeats_with_zero_interval();
-    test_dedup_fails_open_when_saturated();
+typedef void (*AcPortableTestFunction)(void);
 
-    if (g_failures != 0) {
-        fprintf(stderr, "%d portable test(s) failed\n", g_failures);
-        return 1;
+typedef struct AcPortableTestCase {
+    const char *name;
+    AcPortableTestFunction function;
+} AcPortableTestCase;
+
+static const AcPortableTestCase g_test_cases[] = {
+    {"sha256_vectors", test_sha256_vectors},
+    {"sha256_streaming", test_sha256_streaming},
+    {"json_escaping", test_json_escaping},
+    {"fnv1a", test_fnv1a},
+    {"range_index", test_range_index},
+    {"range_index_merges_overlaps", test_range_index_merges_overlaps},
+    {"range_index_many_entries", test_range_index_many_entries},
+    {"dedup_suppresses_repeats", test_dedup_suppresses_repeats},
+    {"dedup_zero_interval", test_dedup_never_repeats_with_zero_interval},
+    {"dedup_saturation", test_dedup_fails_open_when_saturated}
+};
+
+int main(int argc, char **argv)
+{
+    size_t index;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <test-case>\n", argv[0]);
+        return 2;
     }
 
-    puts("all portable tests passed");
-    return 0;
+    for (index = 0;
+         index < sizeof(g_test_cases) / sizeof(g_test_cases[0]);
+         ++index) {
+        const AcPortableTestCase *test_case = &g_test_cases[index];
+
+        if (strcmp(argv[1], test_case->name) != 0) {
+            continue;
+        }
+
+        g_failures = 0;
+        test_case->function();
+
+        if (g_failures != 0) {
+            fprintf(
+                stderr,
+                "%d check(s) failed in portable.%s\n",
+                g_failures,
+                test_case->name);
+            return 1;
+        }
+
+        printf("portable.%s passed\n", test_case->name);
+        return 0;
+    }
+
+    fprintf(stderr, "unknown portable test case: %s\n", argv[1]);
+    return 2;
 }

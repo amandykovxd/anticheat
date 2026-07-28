@@ -31,6 +31,18 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}-release
 
+      - name: Verify automated test inventory
+        shell: pwsh
+        run: |
+          $inventory = (
+            & ctest --preset ${{ matrix.preset }}-release --show-only=json-v1 |
+              Out-String |
+              ConvertFrom-Json
+          )
+          if ($inventory.tests.Count -ne 24) {
+            throw "Expected 24 independent tests, found $($inventory.tests.Count)"
+          }
+
       - name: Test
         run: ctest --preset ${{ matrix.preset }}-release
 
