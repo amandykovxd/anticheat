@@ -66,6 +66,34 @@ modules of an x64 process.
 
 ## Build the user-mode collector
 
+The checked-in presets provide reproducible Visual Studio 2022 x64 and Win32
+build trees. Run the matching configure, Release build, and test presets from
+the repository root:
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64-release
+ctest --preset windows-x64-release
+```
+
+For a Win32 collector:
+
+```powershell
+cmake --preset windows-win32
+cmake --build --preset windows-win32-release
+ctest --preset windows-win32-release
+```
+
+Preset outputs are isolated by architecture:
+
+```text
+out\build\windows-x64\Release\anticheat.exe
+out\build\windows-win32\Release\anticheat.exe
+```
+
+Direct CMake invocation remains supported for custom build directories and
+integrator automation:
+
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release

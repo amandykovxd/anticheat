@@ -1,0 +1,74 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 collector",
+      "description": "Configure the user-mode collector and tests for x64.",
+      "inherits": "windows-base",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/windows-x64"
+    },
+    {
+      "name": "windows-win32",
+      "displayName": "Windows Win32 collector",
+      "description": "Configure the user-mode collector and tests for Win32.",
+      "inherits": "windows-base",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/out/build/windows-win32"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-release",
+      "displayName": "Build Windows x64 Release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-win32-release",
+      "displayName": "Build Windows Win32 Release",
+      "configurePreset": "windows-win32",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x64-release",
+      "displayName": "Test Windows x64 Release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "windows-win32-release",
+      "displayName": "Test Windows Win32 Release",
+      "configurePreset": "windows-win32",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

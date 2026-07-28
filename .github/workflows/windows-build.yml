@@ -14,27 +14,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, Win32]
+        include:
+          - arch: x64
+            preset: windows-x64
+            binary_dir: out/build/windows-x64
+          - arch: Win32
+            preset: windows-win32
+            binary_dir: out/build/windows-win32
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Configure
-        run: cmake -S . -B build -A ${{ matrix.arch }}
+        run: cmake --preset ${{ matrix.preset }}
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build --preset ${{ matrix.preset }}-release
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --preset ${{ matrix.preset }}-release
 
       - name: End-to-end scan against a live process
         shell: pwsh
         run: |
+          $collector = Join-Path '${{ matrix.binary_dir }}' 'Release\anticheat.exe'
           $target = Start-Process -PassThru -FilePath powershell `
             -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 120'
           try {
-            & .\build\Release\anticheat.exe --pid $target.Id --once --quiet --log smoke.jsonl
+            & $collector --pid $target.Id --once --quiet --log smoke.jsonl
             if ($LASTEXITCODE -ne 0) {
               throw "agent exited with $LASTEXITCODE"
             }
@@ -51,7 +58,7 @@ jobs:
         with:
           name: anticheat-${{ matrix.arch }}
           path: |
-            build/Release/anticheat.exe
+            ${{ matrix.binary_dir }}/Release/anticheat.exe
             smoke.jsonl
           if-no-files-found: error
 
