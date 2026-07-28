@@ -64,6 +64,15 @@ if(BUILD_TESTING)
     target_link_libraries(anticheat_tests PRIVATE anticheat_core)
     ac_enable_warnings(anticheat_tests)
     add_test(NAME anticheat_core_tests COMMAND anticheat_tests)
+
+    add_test(
+        NAME anticheat_cli_contract
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DAC_EXECUTABLE=$<TARGET_FILE:anticheat>"
+            "-DAC_WORKING_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/cli-contract"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.cmake"
+    )
 endif()
 
 install(TARGETS anticheat RUNTIME DESTINATION bin)

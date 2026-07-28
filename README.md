@@ -220,6 +220,24 @@ state at the next scan.
 | `--max-log-bytes <n>` | Rotate the active log after `n` bytes. `0` disables rotation. |
 | `--log-generations <n>` | Set the number of retained rotated segments. |
 | `--quiet` | Disable JSONL mirroring to standard output. |
+| `--version` | Print collector, event-schema, and driver-protocol versions, then exit. |
+| `--help` | Print the command-line contract, then exit. |
+
+`--version` is a standalone metadata command. It does not select a target,
+open the driver device, or create a log. Operational options cannot be combined
+with it; a conflicting invocation exits with code `2`.
+
+The output is a stable, line-oriented contract:
+
+```text
+collector_version=0.3.0
+event_schema_version=3
+driver_protocol_version=1
+```
+
+Integrators must parse the keys rather than depend on a fixed numeric value.
+The collector version follows the project release, while schema and protocol
+versions change only with their corresponding compatibility contracts.
 
 Exit codes:
 

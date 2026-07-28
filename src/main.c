@@ -101,6 +101,18 @@ static void ac_print_usage(const wchar_t *program)
         program);
 }
 
+static void ac_print_version(void)
+{
+    fwprintf(
+        stdout,
+        L"collector_version=%hs\n"
+        L"event_schema_version=%u\n"
+        L"driver_protocol_version=%u\n",
+        AC_AGENT_VERSION,
+        AC_SCHEMA_VERSION,
+        AC_DRIVER_PROTOCOL_VERSION);
+}
+
 static bool ac_parse_u64(
     const wchar_t *text,
     uint64_t minimum,
@@ -137,6 +149,12 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
     options->scan_budget_ms = 250u;
     *exit_now = false;
 
+    if (argc == 2 && wcscmp(argv[1], L"--version") == 0) {
+        ac_print_version();
+        *exit_now = true;
+        return true;
+    }
+
     for (index = 1; index < argc; ++index) {
         const wchar_t *argument = argv[index];
         const bool has_value = index + 1 < argc;
@@ -144,11 +162,6 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
 
         if (wcscmp(argument, L"--help") == 0 || wcscmp(argument, L"-h") == 0) {
             ac_print_usage(argv[0]);
-            *exit_now = true;
-            return true;
-        }
-        if (wcscmp(argument, L"--version") == 0) {
-            fwprintf(stdout, L"%hs %hs\n", AC_AGENT_NAME, AC_AGENT_VERSION);
             *exit_now = true;
             return true;
         }
