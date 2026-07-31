@@ -16,9 +16,12 @@ Anticheat Telemetry is a Windows process-integrity sensor composed of:
 - a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
 The kernel driver records process lifecycle and image-load notifications for
-one registered process ID. The user-mode collector inventories modules, maps
+one registered process ID and records subsequent system-mode image loads while
+that session is active. The user-mode collector inventories modules, maps
 executable memory, classifies regions not backed by loader-visible modules,
-applies event de-duplication, and writes a tamper-evident JSONL stream.
+correlates system-security posture, known kernel-device indicators, and
+external overlay behavior, applies event de-duplication, and writes a
+tamper-evident JSONL stream.
 
 The components produce telemetry only. They do not terminate processes,
 modify target memory, block image loads, or issue enforcement decisions.
@@ -123,8 +126,8 @@ core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer
 
 ### Automated test inventory
 
-Windows builds register 40 independent CTest cases: 17 portable algorithms,
-19 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
+Windows builds register 44 independent CTest cases: 17 portable algorithms,
+23 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
 macOS builds register 23 cases: 17 portable cases, 3 CLI contracts, one live
 self-scan, one suspicious-region integration test, and the transport suite.
 Linux sanitizer builds register 18 cases:
@@ -147,7 +150,7 @@ ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 
 The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
 `transport`, and `integration`. The Windows CI matrix rejects a configuration
-that does not expose exactly 40 independent CTest entries.
+that does not expose exactly 44 independent CTest entries.
 
 ## Build and run on macOS
 
@@ -432,13 +435,18 @@ Kernel-originated records contain the driver's independent sequence number and
 - `kernel_process_created`;
 - `kernel_process_exited`;
 - `kernel_image_loaded`;
+- `kernel_system_image_loaded`;
 - `kernel_event_queue_saturated`;
 - `kernel_event_queue_overflow`;
 - `kernel_event_sequence_gap`;
 - `kernel_callback_health_degraded`;
 - `kernel_user_module_mismatch`;
 - `kernel_user_scan_correlation`;
-- `kernel_event_read_failed`.
+- `kernel_event_read_failed`;
+- `kernel_attack_surface_posture`;
+- `known_threat_indicator_observed`;
+- `external_overlay_candidate`;
+- `threat_sensor_scan_completed`.
 
 The complete schema is defined in
 [docs/event-schema.md](docs/event-schema.md).
@@ -465,8 +473,9 @@ python tools\verify_log.py `
   cannot replace or clear an active registration.
 - Target registration is PID-based. The collector separately validates target
   image path and process creation time.
-- The driver reports image loads for the active PID, direct child-process
-  creation, and target exit. It clears the active PID after recording exit.
+- The driver reports image loads for the active PID, system-mode images loaded
+  after session registration, direct child-process creation, and target exit.
+  It clears the active PID after recording exit.
 - Kernel callbacks report image mappings; they do not inspect or modify image
   contents.
 - The driver does not enumerate image mappings that occurred before target
@@ -493,6 +502,7 @@ src/
   kernel_client.c         user-mode driver client
   process.c               target discovery and identity validation
   scanner.c               module and memory telemetry
+  threat_sensor.c         posture, kernel-device, process, and overlay signals
   integrity.c             PE section, import and export validation
   log.c                   JSONL output, rotation, integrity chain
   dedup.c                 bounded finding de-duplication
@@ -517,6 +527,7 @@ tools/
 - [Transport integration](docs/transport-integration.md)
 - [Event schema](docs/event-schema.md)
 - [Adversarial analysis](docs/adversarial-analysis.md)
+- [DragonBurn defensive analysis](docs/dragonburn-threat-analysis.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
 - [Engineering project contract](docs/project-board.md)

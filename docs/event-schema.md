@@ -99,7 +99,7 @@ Fields:
 | --- | --- | --- |
 | `agent` | string | `anticheat-collector` |
 | `version` | string | collector semantic version |
-| `schema` | unsigned integer | `4` |
+| `schema` | unsigned integer | `5` |
 | `mode` | string | `user_telemetry` or `hybrid_kernel_user_telemetry` |
 | `memory_write_access` | boolean | `false` |
 | `terminates_target` | boolean | `false` |
@@ -251,6 +251,7 @@ The following event identifiers use the same detail contract:
 - `kernel_process_created`;
 - `kernel_process_exited`;
 - `kernel_image_loaded`;
+- `kernel_system_image_loaded`;
 - `kernel_event_unknown`.
 
 Fields:
@@ -282,6 +283,11 @@ Driver event types:
 In that case the envelope `pid` is the child PID and `details.parent_pid` is
 the registered target PID.
 
+`kernel_system_image_loaded` describes a system-mode image loaded after the
+target session was registered. Its envelope `pid` is `0` and the system-image
+flag is set. The callback does not replay earlier driver loads and does not
+observe manual mappings that bypass the operating-system image loader.
+
 Driver event flags:
 
 | Bit | Identifier |
@@ -289,6 +295,73 @@ Driver event flags:
 | `0x00000001` | `AC_DRIVER_EVENT_FLAG_PATH_TRUNCATED` |
 | `0x00000002` | `AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE` |
 | `0x00000004` | `AC_DRIVER_EVENT_FLAG_PATH_UNAVAILABLE` |
+
+## System threat sensor events
+
+### `kernel_attack_surface_posture`
+
+Severity: `info` through `high`, based on explicitly configured values.
+
+Fields:
+
+- `configured_vulnerable_driver_blocklist`;
+- `configured_hvci`;
+- `configured_vbs`;
+- `configured_run_as_ppl`;
+- `source`: `registry`;
+- `source_trust`: `untrusted_user_mode`;
+- `verdict`: `telemetry_only`.
+
+Values are `enabled`, `disabled`, or `unknown`. Registry absence is reported
+as `unknown`; the collector does not infer active boot state from a missing
+value. An explicitly disabled vulnerable-driver blocklist is `high`. Disabled
+HVCI or VBS is `medium`. This event is not an enforcement decision.
+
+### `known_threat_indicator_observed`
+
+Severity: `medium` or `high`.
+
+Fields:
+
+- `indicator_set`: versioned source-revision identifier;
+- `category`: `process_image` or `dos_device`;
+- `indicator`;
+- `observed_name`;
+- `observed_pid`;
+- `first_seen`;
+- `occurrences`;
+- `source_trust`: `untrusted_user_mode`;
+- `verdict`: `signal_only`.
+
+Indicators identify a known implementation revision. Names and device links
+are renameable and must be correlated with behavioral and kernel telemetry.
+
+### `external_overlay_candidate`
+
+Severity: `medium`.
+
+Fields:
+
+- `owner_pid` and `target_pid`;
+- `topmost`, `transparent`, `layered`, and `no_activate`;
+- `ui_access`;
+- `capture_excluded`;
+- `overlap_per_mille`;
+- `source_trust`: `untrusted_user_mode`;
+- `verdict`: `signal_only`.
+
+The classifier requires a topmost transparent window overlapping at least 85
+percent of the target, an overlay-compatible extended style, and either a
+UIAccess token or capture exclusion. Legitimate accessibility and overlay
+software can match; the event is never sufficient for an automatic sanction.
+
+### `threat_sensor_scan_completed`
+
+Severity: `info`.
+
+The record contains inventory counts, observed and suppressed signal counts,
+and independent completion flags for process, DOS-device, and window
+inventories. Any false completion flag is a coverage gap for that scan.
 
 ### `kernel_event_queue_overflow`
 

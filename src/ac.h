@@ -31,6 +31,7 @@
 #define AC_INTEGRITY_MAX_HOOK_EVENTS 16u
 #define AC_KERNEL_MAX_IMAGE_OBSERVATIONS 256u
 #define AC_KERNEL_MAX_MISMATCH_EVENTS 32u
+#define AC_THREAT_DEDUP_CAPACITY 256u
 
 typedef enum AcSeverity {
     AC_SEVERITY_INFO,
@@ -180,6 +181,40 @@ typedef struct AcTarget {
     wchar_t *directory;
 } AcTarget;
 
+typedef enum AcConfiguredState {
+    AC_CONFIGURED_UNKNOWN = -1,
+    AC_CONFIGURED_DISABLED = 0,
+    AC_CONFIGURED_ENABLED = 1
+} AcConfiguredState;
+
+typedef struct AcOverlayFeatures {
+    bool topmost;
+    bool transparent;
+    bool layered;
+    bool no_activate;
+    bool ui_access;
+    bool capture_excluded;
+    uint32_t overlap_per_mille;
+} AcOverlayFeatures;
+
+typedef struct AcThreatScanStats {
+    size_t processes_visited;
+    size_t device_names_visited;
+    size_t windows_visited;
+    size_t indicators_observed;
+    size_t overlay_candidates;
+    size_t events_emitted;
+    size_t events_suppressed;
+    bool process_inventory_complete;
+    bool device_inventory_complete;
+    bool window_inventory_complete;
+} AcThreatScanStats;
+
+typedef struct AcThreatSensor {
+    AcDedup dedup;
+    bool posture_reported;
+} AcThreatSensor;
+
 typedef struct AcKernelImageObservation {
     uint64_t sequence;
     uint64_t image_base;
@@ -238,6 +273,31 @@ bool ac_get_process_path(HANDLE process, wchar_t **path_out);
 bool ac_get_process_start_time(HANDLE process, uint64_t *start_time_out);
 bool ac_get_parent_directory(const wchar_t *path, wchar_t **directory_out);
 bool ac_process_image_matches_name(const wchar_t *image_path, const wchar_t *name);
+
+const char *ac_known_threat_process_indicator(
+    const wchar_t *image_name,
+    AcSeverity *severity_out);
+const char *ac_known_threat_device_indicator(
+    const wchar_t *device_name,
+    AcSeverity *severity_out);
+AcSeverity ac_security_posture_severity(
+    AcConfiguredState vulnerable_driver_blocklist,
+    AcConfiguredState hvci,
+    AcConfiguredState vbs,
+    AcConfiguredState run_as_ppl);
+bool ac_overlay_features_suspicious(const AcOverlayFeatures *features);
+bool ac_threat_sensor_init(AcThreatSensor *sensor, uint64_t repeat_interval_ms);
+void ac_threat_sensor_free(AcThreatSensor *sensor);
+void ac_threat_sensor_report_posture(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid);
+void ac_threat_sensor_scan(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t scan_id,
+    AcThreatScanStats *stats_out);
 
 void ac_module_list_init(AcModuleList *modules);
 void ac_module_list_free(AcModuleList *modules);

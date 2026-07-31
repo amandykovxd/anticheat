@@ -246,7 +246,7 @@ bool ac_kernel_client_observe_drop_counter(
     return true;
 }
 
-static const char *ac_kernel_event_name(uint32_t type)
+static const char *ac_kernel_event_name(uint32_t type, uint32_t flags)
 {
     switch (type) {
         case AC_DRIVER_EVENT_TARGET_CHANGED:
@@ -256,7 +256,9 @@ static const char *ac_kernel_event_name(uint32_t type)
         case AC_DRIVER_EVENT_PROCESS_EXITED:
             return "kernel_process_exited";
         case AC_DRIVER_EVENT_IMAGE_LOADED:
-            return "kernel_image_loaded";
+            return (flags & AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE) != 0
+                ? "kernel_system_image_loaded"
+                : "kernel_image_loaded";
         default:
             return "kernel_event_unknown";
     }
@@ -325,7 +327,7 @@ static void ac_log_kernel_event(
     ac_log_event(
         logger,
         AC_SEVERITY_INFO,
-        ac_kernel_event_name(event->type),
+        ac_kernel_event_name(event->type, event->flags),
         event->process_id,
         details);
 }

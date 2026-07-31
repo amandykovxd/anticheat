@@ -25,6 +25,7 @@ enforcement.
 - [Authenticated transport and remote anchoring](transport-integration.html)
 - [Event schema](event-schema.html)
 - [Adversarial analysis](adversarial-analysis.html)
+- [DragonBurn defensive analysis](dragonburn-threat-analysis.html)
 - [Engineering project contract](project-board.html)
 
 ## Engineering coordination

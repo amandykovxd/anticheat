@@ -133,6 +133,110 @@ static void test_wide_to_utf8(void)
     AC_CHECK(!ac_wide_to_utf8(NULL, buffer, sizeof(buffer)));
 }
 
+static void test_threat_process_indicators(void)
+{
+    AcSeverity severity = AC_SEVERITY_INFO;
+    const char *indicator;
+
+    indicator = ac_known_threat_process_indicator(
+        L"DragonBurn-kernel.exe",
+        &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(strcmp(indicator, "dragonburn_kernel_mapper_image") == 0);
+    AC_CHECK(severity == AC_SEVERITY_HIGH);
+
+    indicator = ac_known_threat_process_indicator(
+        L"DRAGONBURN-USERMODE.EXE",
+        &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(strcmp(indicator, "dragonburn_user_client_image") == 0);
+    AC_CHECK(severity == AC_SEVERITY_HIGH);
+
+    indicator = ac_known_threat_process_indicator(L"DragonBurn.exe", &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(severity == AC_SEVERITY_MEDIUM);
+    AC_CHECK(ac_known_threat_process_indicator(L"game.exe", &severity) == NULL);
+    AC_CHECK(severity == AC_SEVERITY_INFO);
+    AC_CHECK(ac_known_threat_process_indicator(NULL, &severity) == NULL);
+}
+
+static void test_threat_device_indicators(void)
+{
+    AcSeverity severity = AC_SEVERITY_INFO;
+    const char *indicator;
+
+    indicator = ac_known_threat_device_indicator(L"DragonBurn-kmd", &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(strcmp(indicator, "dragonburn_kernel_device") == 0);
+    AC_CHECK(severity == AC_SEVERITY_HIGH);
+
+    indicator = ac_known_threat_device_indicator(L"NAL", &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(strcmp(indicator, "intel_vulnerable_driver_device") == 0);
+    AC_CHECK(severity == AC_SEVERITY_MEDIUM);
+
+    AC_CHECK(ac_known_threat_device_indicator(L"AcTelemetry", &severity) == NULL);
+    AC_CHECK(severity == AC_SEVERITY_INFO);
+    AC_CHECK(ac_known_threat_device_indicator(NULL, &severity) == NULL);
+}
+
+static void test_threat_posture_classification(void)
+{
+    AC_CHECK(ac_security_posture_severity(
+        AC_CONFIGURED_DISABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED) == AC_SEVERITY_HIGH);
+    AC_CHECK(ac_security_posture_severity(
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_DISABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED) == AC_SEVERITY_MEDIUM);
+    AC_CHECK(ac_security_posture_severity(
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_DISABLED,
+        AC_CONFIGURED_ENABLED) == AC_SEVERITY_MEDIUM);
+    AC_CHECK(ac_security_posture_severity(
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_ENABLED,
+        AC_CONFIGURED_DISABLED) == AC_SEVERITY_LOW);
+    AC_CHECK(ac_security_posture_severity(
+        AC_CONFIGURED_UNKNOWN,
+        AC_CONFIGURED_UNKNOWN,
+        AC_CONFIGURED_UNKNOWN,
+        AC_CONFIGURED_UNKNOWN) == AC_SEVERITY_INFO);
+}
+
+static void test_threat_overlay_classification(void)
+{
+    AcOverlayFeatures features;
+
+    memset(&features, 0, sizeof(features));
+    features.topmost = true;
+    features.transparent = true;
+    features.no_activate = true;
+    features.ui_access = true;
+    features.overlap_per_mille = 1000u;
+    AC_CHECK(ac_overlay_features_suspicious(&features));
+
+    features.ui_access = false;
+    features.capture_excluded = true;
+    features.layered = true;
+    AC_CHECK(ac_overlay_features_suspicious(&features));
+
+    features.capture_excluded = false;
+    AC_CHECK(!ac_overlay_features_suspicious(&features));
+    features.ui_access = true;
+    features.overlap_per_mille = 849u;
+    AC_CHECK(!ac_overlay_features_suspicious(&features));
+    features.overlap_per_mille = 1000u;
+    features.transparent = false;
+    AC_CHECK(!ac_overlay_features_suspicious(&features));
+    AC_CHECK(!ac_overlay_features_suspicious(NULL));
+}
+
 static bool ac_hex_to_bytes(const char *hex, uint8_t *output, size_t count)
 {
     size_t index;
@@ -919,7 +1023,11 @@ static const AcCoreTestCase g_test_cases[] = {
     {"driver_protocol_session", test_driver_protocol_session_layout},
     {"kernel_sequence_gap", test_kernel_sequence_gap_is_detected},
     {"kernel_drop_counter", test_kernel_drop_counter_is_monotonic},
-    {"kernel_user_correlation", test_kernel_user_module_correlation}
+    {"kernel_user_correlation", test_kernel_user_module_correlation},
+    {"threat_process_indicators", test_threat_process_indicators},
+    {"threat_device_indicators", test_threat_device_indicators},
+    {"threat_posture_classification", test_threat_posture_classification},
+    {"threat_overlay_classification", test_threat_overlay_classification}
 };
 
 int main(int argc, char **argv)

@@ -222,19 +222,22 @@ static VOID AcImageNotify(
     AcDriverEvent event;
     const ULONG pid = AcHandleToPid(process_id);
     const ULONG target_pid = AcGetTargetPid();
+    BOOLEAN system_image;
 
-    if (image_info == NULL ||
-        target_pid == 0 ||
-        pid != target_pid) {
+    if (image_info == NULL || target_pid == 0) {
+        return;
+    }
+    system_image = image_info->SystemModeImage != 0;
+    if (!system_image && pid != target_pid) {
         return;
     }
 
     RtlZeroMemory(&event, sizeof(event));
     event.type = AC_DRIVER_EVENT_IMAGE_LOADED;
-    event.process_id = pid;
+    event.process_id = system_image ? 0 : pid;
     event.image_base = (uint64_t)(ULONG_PTR)image_info->ImageBase;
     event.image_size = (uint64_t)image_info->ImageSize;
-    if (image_info->SystemModeImage != 0) {
+    if (system_image) {
         event.flags |= AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE;
     }
     AcCopyUnicodePath(&event, full_image_name);

@@ -482,6 +482,7 @@ int wmain(int argc, wchar_t **argv)
     AcLogger logger;
     AcContext context;
     AcKernelClient kernel_client;
+    AcThreatSensor threat_sensor;
     AcPolicy policy;
     AcTarget target;
     const wchar_t *roots[AC_MAX_ALLOW_ROOTS];
@@ -494,15 +495,20 @@ int wmain(int argc, wchar_t **argv)
     uint64_t kernel_events_dropped = 0;
     uint64_t kernel_sequence_events_missing = 0;
     uint64_t kernel_module_mismatches = 0;
+    uint64_t threat_indicators_observed = 0;
+    uint64_t threat_overlay_candidates = 0;
+    uint64_t threat_events_emitted = 0;
     size_t root_count = 0;
     size_t root_index;
     bool exit_now = false;
     bool context_ready = false;
     bool kernel_ready = false;
+    bool threat_sensor_ready = false;
     bool kernel_telemetry_complete = true;
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
+    memset(&threat_sensor, 0, sizeof(threat_sensor));
     ac_kernel_client_init(&kernel_client);
 
     if (!ac_parse_options(argc, argv, &options, &exit_now)) {
@@ -625,6 +631,23 @@ int wmain(int argc, wchar_t **argv)
     }
     context_ready = true;
 
+    if (!ac_threat_sensor_init(
+            &threat_sensor,
+            options.repeat_interval_ms)) {
+        ac_log_event(
+            &logger,
+            AC_SEVERITY_LOW,
+            "threat_sensor_init_failed",
+            target.pid,
+            "{\"reason\":\"out_of_memory\",\"coverage_complete\":false}");
+    } else {
+        threat_sensor_ready = true;
+        ac_threat_sensor_report_posture(
+            &threat_sensor,
+            &logger,
+            target.pid);
+    }
+
     ac_log_allow_roots(&logger, target.pid, roots, root_count);
 
     {
@@ -718,6 +741,7 @@ int wmain(int argc, wchar_t **argv)
 
     for (;;) {
         AcScanStats stats;
+        AcThreatScanStats threat_stats;
         HANDLE wait_handles[2];
         DWORD wait_result;
         bool scan_succeeded;
@@ -773,6 +797,18 @@ int wmain(int argc, wchar_t **argv)
                 break;
             }
             ac_log_win32_error(&logger, "scan_failed", target.pid, error);
+        }
+
+        if (threat_sensor_ready) {
+            ac_threat_sensor_scan(
+                &threat_sensor,
+                &logger,
+                target.pid,
+                scan_id,
+                &threat_stats);
+            threat_indicators_observed += threat_stats.indicators_observed;
+            threat_overlay_candidates += threat_stats.overlay_candidates;
+            threat_events_emitted += threat_stats.events_emitted;
         }
 
         if (kernel_ready &&
@@ -934,6 +970,9 @@ cleanup:
         "\"kernel_events_dropped\":%" PRIu64 ","
         "\"kernel_sequence_events_missing\":%" PRIu64 ","
         "\"kernel_module_mismatches\":%" PRIu64 ","
+        "\"threat_indicators_observed\":%" PRIu64 ","
+        "\"threat_overlay_candidates\":%" PRIu64 ","
+        "\"threat_events_emitted\":%" PRIu64 ","
         "\"kernel_telemetry_complete\":%s,"
         "\"log_write_failures\":%" PRIu64 ",\"log_truncated_lines\":%" PRIu64 ","
         "\"exit_code\":%d}",
@@ -942,6 +981,9 @@ cleanup:
         kernel_events_dropped,
         kernel_sequence_events_missing,
         kernel_module_mismatches,
+        threat_indicators_observed,
+        threat_overlay_candidates,
+        threat_events_emitted,
         (options.kernel_telemetry && kernel_telemetry_complete)
             ? "true"
             : "false",
@@ -952,6 +994,9 @@ cleanup:
 
     if (context_ready) {
         ac_context_free(&context);
+    }
+    if (threat_sensor_ready) {
+        ac_threat_sensor_free(&threat_sensor);
     }
     if (kernel_ready) {
         (void)ac_kernel_client_set_target(&kernel_client, 0);

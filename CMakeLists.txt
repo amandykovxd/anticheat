@@ -163,9 +163,10 @@ add_library(anticheat_core STATIC
     src/log.c
     src/process.c
     src/scanner.c
+    src/threat_sensor.c
 )
 target_include_directories(anticheat_core PUBLIC src include)
-target_link_libraries(anticheat_core PUBLIC anticheat_portable bcrypt)
+target_link_libraries(anticheat_core PUBLIC anticheat_portable bcrypt advapi32 user32)
 target_compile_definitions(anticheat_core PUBLIC
     UNICODE
     _UNICODE
@@ -208,6 +209,10 @@ if(BUILD_TESTING)
         kernel_sequence_gap
         kernel_drop_counter
         kernel_user_correlation
+        threat_process_indicators
+        threat_device_indicators
+        threat_posture_classification
+        threat_overlay_classification
     )
     foreach(test_case IN LISTS AC_CORE_TEST_CASES)
         add_test(
