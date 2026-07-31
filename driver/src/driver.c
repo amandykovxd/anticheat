@@ -1,11 +1,36 @@
+/* ntifs.h declares PsLookupProcessByProcessId and must precede ntddk.h. */
+#include <ntifs.h>
 #include <ntddk.h>
 #include <wdmsec.h>
 
 #include "ac_driver_protocol.h"
 
-_Static_assert(
+AC_DRIVER_STATIC_ASSERT(
     sizeof(WCHAR) == sizeof(uint16_t),
     "driver protocol requires 16-bit WCHAR");
+
+/*
+ * wdm.h defines PROCESS_DUP_HANDLE, but the remaining process access rights
+ * this driver treats as dangerous are declared only in the user-mode winnt.h.
+ */
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001u
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD 0x0002u
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION 0x0008u
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ 0x0010u
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020u
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME 0x0800u
+#endif
 
 #if defined(__MINGW32__)
 NTKERNELAPI NTSTATUS NTAPI PsLookupProcessByProcessId(

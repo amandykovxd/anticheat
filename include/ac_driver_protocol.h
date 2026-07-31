@@ -1,11 +1,22 @@
 #ifndef AC_DRIVER_PROTOCOL_H
 #define AC_DRIVER_PROTOCOL_H
 
-#include <stdint.h>
-
 #if defined(_KERNEL_MODE)
 #include <ntddk.h>
+
+/*
+ * The kernel-mode include set ships no <stdint.h>, so including it here pulls
+ * in the user-mode CRT copy, which redefines macros the WDK headers own. Take
+ * the fixed-width types from basetsd.h instead; the wire layout below is then
+ * identical on both sides of the IOCTL boundary.
+ */
+typedef UINT16 uint16_t;
+typedef INT32 int32_t;
+typedef UINT32 uint32_t;
+typedef UINT64 uint64_t;
 #else
+#include <stdint.h>
+
 #include <windows.h>
 #include <winioctl.h>
 #endif
@@ -108,29 +119,43 @@ typedef struct AcDriverEvent {
 
 #pragma pack(pop)
 
+/*
+ * The kernel-mode toolset compiles this header as legacy C, where neither
+ * static_assert nor _Static_assert exists. Fall back to a declaration whose
+ * type is only valid when the condition holds, so the layout contract is
+ * still enforced at compile time on every side of the boundary.
+ */
 #if defined(__cplusplus)
-static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
-static_assert(sizeof(AcDriverTargetRequest) == 24u, "protocol layout mismatch");
-static_assert(sizeof(AcDriverStats) == 56u, "protocol layout mismatch");
-static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
-static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
-              "IOCTL values must be unique");
-static_assert(IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS,
-              "IOCTL values must be unique");
-static_assert(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
-              "IOCTL values must be unique");
-#elif defined(_MSC_VER) || \
-      (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
-_Static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
-_Static_assert(sizeof(AcDriverTargetRequest) == 24u, "protocol layout mismatch");
-_Static_assert(sizeof(AcDriverStats) == 56u, "protocol layout mismatch");
-_Static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
-_Static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
-               "IOCTL values must be unique");
-_Static_assert(IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS,
-               "IOCTL values must be unique");
-_Static_assert(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
-               "IOCTL values must be unique");
+#define AC_DRIVER_STATIC_ASSERT(condition, message) \
+    static_assert(condition, message)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define AC_DRIVER_STATIC_ASSERT(condition, message) \
+    _Static_assert(condition, message)
+#else
+#define AC_DRIVER_STATIC_ASSERT_NAMED(condition, line) \
+    typedef char ac_driver_static_assert_##line[(condition) ? 1 : -1]
+#define AC_DRIVER_STATIC_ASSERT_EXPAND(condition, line) \
+    AC_DRIVER_STATIC_ASSERT_NAMED(condition, line)
+#define AC_DRIVER_STATIC_ASSERT(condition, message) \
+    AC_DRIVER_STATIC_ASSERT_EXPAND(condition, __LINE__)
 #endif
+
+AC_DRIVER_STATIC_ASSERT(
+    sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
+AC_DRIVER_STATIC_ASSERT(
+    sizeof(AcDriverTargetRequest) == 24u, "protocol layout mismatch");
+AC_DRIVER_STATIC_ASSERT(
+    sizeof(AcDriverStats) == 56u, "protocol layout mismatch");
+AC_DRIVER_STATIC_ASSERT(
+    sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
+AC_DRIVER_STATIC_ASSERT(
+    IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
+    "IOCTL values must be unique");
+AC_DRIVER_STATIC_ASSERT(
+    IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS,
+    "IOCTL values must be unique");
+AC_DRIVER_STATIC_ASSERT(
+    IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
+    "IOCTL values must be unique");
 
 #endif
