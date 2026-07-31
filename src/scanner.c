@@ -662,8 +662,15 @@ static void ac_scan_memory_regions(
         if (VirtualQueryEx(target->process, (LPCVOID)address, &memory, sizeof(memory)) == 0) {
             const DWORD error = GetLastError();
 
+            if (error == ERROR_INVALID_PARAMETER) {
+                if (maximum_address - address >
+                    (uintptr_t)system_info.dwPageSize) {
+                    ++stats->query_failures;
+                }
+                break;
+            }
             ++stats->query_failures;
-            if (error == ERROR_INVALID_PARAMETER || error == ERROR_ACCESS_DENIED) {
+            if (error == ERROR_ACCESS_DENIED) {
                 break;
             }
             next_address = address + system_info.dwPageSize;
@@ -792,27 +799,54 @@ bool ac_scan_process(
     ac_verify_module_integrity(context, target, scan_id, &stats);
 
     stats.duration_ms = (uint64_t)(GetTickCount64() - started_ms);
+    stats.coverage_complete =
+        context->modules.count > 0 &&
+        !context->modules.truncated &&
+        !stats.region_scan_truncated &&
+        stats.region_events_omitted == 0 &&
+        stats.query_failures == 0 &&
+        stats.read_failures == 0 &&
+        context->policy.verify_module_integrity &&
+        stats.integrity_modules_unavailable == 0 &&
+        stats.integrity_unreadable_blocks == 0 &&
+        stats.integrity_modules_partial == 0 &&
+        stats.integrity_modules_skipped == 0;
     ++context->scans_completed;
 
-    if (context->modules.truncated ||
-        stats.region_scan_truncated ||
-        stats.region_events_omitted > 0 ||
-        stats.integrity_modules_partial > 0 ||
-        stats.integrity_modules_skipped > 0) {
+    if (!stats.coverage_complete) {
         (void)snprintf(
             details,
             sizeof(details),
             "{\"scan_id\":%" PRIu64 ",\"module_list_truncated\":%s,"
+            "\"module_snapshot_empty\":%s,"
             "\"region_scan_truncated\":%s,\"region_events_omitted\":%zu,"
+            "\"query_failures\":%zu,\"read_failures\":%zu,"
+            "\"integrity_disabled\":%s,"
+            "\"integrity_modules_unavailable\":%zu,"
+            "\"integrity_unreadable_blocks\":%zu,"
             "\"integrity_modules_partial\":%zu,"
             "\"integrity_modules_skipped\":%zu,"
+            "\"possible_user_mode_api_interference\":%s,"
             "\"reason\":\"scan_coverage_incomplete\"}",
             scan_id,
             context->modules.truncated ? "true" : "false",
+            context->modules.count == 0 ? "true" : "false",
             stats.region_scan_truncated ? "true" : "false",
             stats.region_events_omitted,
+            stats.query_failures,
+            stats.read_failures,
+            context->policy.verify_module_integrity ? "false" : "true",
+            stats.integrity_modules_unavailable,
+            stats.integrity_unreadable_blocks,
             stats.integrity_modules_partial,
-            stats.integrity_modules_skipped);
+            stats.integrity_modules_skipped,
+            (context->modules.count == 0 ||
+             stats.query_failures > 0 ||
+             stats.read_failures > 0 ||
+             stats.integrity_modules_unavailable > 0 ||
+             stats.integrity_unreadable_blocks > 0)
+                ? "true"
+                : "false");
         ac_log_event(
             context->logger,
             AC_SEVERITY_MEDIUM,
@@ -839,7 +873,9 @@ bool ac_scan_process(
         "\"integrity_modules_partial\":%zu,\"integrity_modules_skipped\":%zu,"
         "\"integrity_file_changes\":%zu,\"region_events_omitted\":%zu,"
         "\"region_scan_truncated\":%s,\"integrity_bytes\":%" PRIu64
-        ",\"integrity_baselines\":%zu}",
+        ",\"integrity_baselines\":%zu,\"complete\":%s,"
+        "\"source\":\"user_mode_win32_api\","
+        "\"source_trust\":\"untrusted\"}",
         scan_id,
         stats.duration_ms,
         stats.module_count,
@@ -870,7 +906,8 @@ bool ac_scan_process(
         stats.region_events_omitted,
         stats.region_scan_truncated ? "true" : "false",
         stats.integrity_bytes,
-        context->integrity.count);
+        context->integrity.count,
+        stats.coverage_complete ? "true" : "false");
     ac_log_event(context->logger, AC_SEVERITY_INFO, "scan_completed", target->pid, details);
 
     if (context->policy.scan_budget_ms > 0 &&

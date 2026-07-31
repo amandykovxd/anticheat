@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 
 PROTOCOL_VERSION = 1
-SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({4, 5})
 CHAIN_ALGORITHM = "sha256"
 CHAIN_MARKER = b',"chain":"'
 CHAIN_HEX_LENGTH = 64

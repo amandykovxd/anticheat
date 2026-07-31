@@ -205,6 +205,9 @@ if(BUILD_TESTING)
         integrity_module_identity
         integrity_budget_gap
         driver_protocol_session
+        kernel_sequence_gap
+        kernel_drop_counter
+        kernel_user_correlation
     )
     foreach(test_case IN LISTS AC_CORE_TEST_CASES)
         add_test(

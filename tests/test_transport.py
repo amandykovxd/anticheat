@@ -52,7 +52,9 @@ def make_record(
     return body + f',"chain":"{chain}"}}'.encode("ascii"), chain
 
 
-def make_session_records(count: int = 4, seed_byte: int = 0x42) -> tuple[str, list[bytes]]:
+def make_session_records(
+    count: int = 4, seed_byte: int = 0x42, schema_version: int = 4
+) -> tuple[str, list[bytes]]:
     seed = bytes([seed_byte]) * 32
     seed_hex = seed.hex()
     records: list[bytes] = []
@@ -60,7 +62,7 @@ def make_session_records(count: int = 4, seed_byte: int = 0x42) -> tuple[str, li
     first, chain = make_record(
         1,
         "log_segment_opened",
-        {"schema": 4, "chain_seed": seed_hex},
+        {"schema": schema_version, "chain_seed": seed_hex},
         chain,
     )
     records.append(first)
@@ -72,12 +74,16 @@ def make_session_records(count: int = 4, seed_byte: int = 0x42) -> tuple[str, li
     return seed_hex, records
 
 
-def session_request(seed: str, client_session_id: str = "a" * 32) -> dict[str, Any]:
+def session_request(
+    seed: str,
+    client_session_id: str = "a" * 32,
+    schema_version: int = 4,
+) -> dict[str, Any]:
     return {
         "protocol_version": PROTOCOL_VERSION,
         "client_session_id": client_session_id,
         "collector_id": "test-endpoint",
-        "schema_version": 4,
+        "schema_version": schema_version,
         "chain_algorithm": "sha256",
         "chain_seed": seed,
     }
@@ -150,6 +156,21 @@ class ReceiverStoreTests(unittest.TestCase):
         self.assertEqual(status, HTTPStatus.OK)
         self.assertTrue(response["duplicate"])
         self.assertEqual(response["session_id"], self.session_id)
+
+    def test_schema_five_session_is_accepted(self) -> None:
+        seed, records = make_session_records(
+            1,
+            seed_byte=0x51,
+            schema_version=5,
+        )
+        request = session_request(
+            seed,
+            client_session_id="5" * 32,
+            schema_version=5,
+        )
+        status, _response = self.store.create_session(request)
+        self.assertEqual(status, HTTPStatus.CREATED)
+        self.assertEqual(chain_seed_from_open_record(records[0], 5), seed)
 
     def test_session_idempotency_key_cannot_change_metadata(self) -> None:
         request = session_request(self.seed)

@@ -756,11 +756,141 @@ static void test_driver_protocol_session_layout(void)
     request_size = sizeof(request);
     stats_size = sizeof(stats);
 
-    AC_CHECK(protocol_version == 2u);
+    AC_CHECK(protocol_version == 3u);
     AC_CHECK(request_size == 24u);
     AC_CHECK(stats_size == 56u);
     AC_CHECK(request.session_id != 0);
     AC_CHECK(request.reserved == 0);
+}
+
+static void test_kernel_sequence_gap_is_detected(void)
+{
+    AcKernelClient client;
+    uint64_t missing = UINT64_MAX;
+
+    ac_kernel_client_init(&client);
+    AC_CHECK(client.telemetry_complete);
+    AC_CHECK(ac_kernel_client_observe_sequence(&client, 1u, &missing));
+    AC_CHECK(missing == 0);
+    AC_CHECK(ac_kernel_client_observe_sequence(&client, 4u, &missing));
+    AC_CHECK(missing == 2u);
+    AC_CHECK(client.sequence_events_missing == 2u);
+    AC_CHECK(!client.telemetry_complete);
+    AC_CHECK(!ac_kernel_client_observe_sequence(&client, 4u, &missing));
+}
+
+static void test_kernel_drop_counter_is_monotonic(void)
+{
+    AcKernelClient client;
+    AcDriverStats stats;
+    AcLogger logger;
+    wchar_t path[MAX_PATH];
+    uint64_t newly_dropped = UINT64_MAX;
+
+    if (!ac_temp_log_path(
+            path,
+            sizeof(path) / sizeof(path[0]),
+            L"ac-kernel-drop")) {
+        AC_CHECK(false);
+        return;
+    }
+    (void)_wremove(path);
+
+    ac_kernel_client_init(&client);
+    memset(&stats, 0, sizeof(stats));
+    stats.next_sequence = 1u;
+    stats.events_dropped = 7u;
+    stats.queue_depth = AC_DRIVER_QUEUE_CAPACITY;
+    stats.queue_capacity = AC_DRIVER_QUEUE_CAPACITY;
+    stats.callbacks_active = 3u;
+    if (!ac_logger_open(&logger, path, false, 0, 0)) {
+        AC_CHECK(false);
+        return;
+    }
+    AC_CHECK(ac_kernel_client_process_stats(
+        &client,
+        &logger,
+        GetCurrentProcessId(),
+        &stats));
+    AC_CHECK(client.last_dropped == 7u);
+    AC_CHECK(!client.telemetry_complete);
+    ac_logger_close(&logger);
+    AC_CHECK(ac_test_log_contains_both(
+        path,
+        "\"severity\":\"high\"",
+        "\"event\":\"kernel_event_queue_overflow\""));
+    AC_CHECK(ac_test_log_contains_both(
+        path,
+        "\"possible_attack\":\"event_flooding\"",
+        "\"required_action\":\"invalidate_session_evidence\""));
+    AC_CHECK(!ac_kernel_client_observe_drop_counter(
+        &client,
+        6u,
+        &newly_dropped));
+    (void)_wremove(path);
+}
+
+static void test_kernel_user_module_correlation(void)
+{
+    AcKernelClient client;
+    AcLogger logger;
+    AcRangeIndex ranges;
+    wchar_t path[MAX_PATH];
+    uint64_t mismatches = 0;
+
+    if (!ac_temp_log_path(
+            path,
+            sizeof(path) / sizeof(path[0]),
+            L"ac-kernel-correlation")) {
+        AC_CHECK(false);
+        return;
+    }
+    (void)_wremove(path);
+
+    ac_kernel_client_init(&client);
+    client.image_observations[0].sequence = 2u;
+    client.image_observations[0].image_base = 0x100000u;
+    client.image_observations[0].image_size = 0x2000u;
+    client.image_observations[1].sequence = 3u;
+    client.image_observations[1].image_base = 0x900000u;
+    client.image_observations[1].image_size = 0x3000u;
+    client.image_observation_count = 2u;
+
+    ac_range_index_init(&ranges);
+    if (!ac_range_index_add(&ranges, 0x100000u, 0x2000u)) {
+        AC_CHECK(false);
+        ac_range_index_free(&ranges);
+        return;
+    }
+    ac_range_index_finalize(&ranges);
+    if (!ac_logger_open(&logger, path, false, 0, 0)) {
+        AC_CHECK(false);
+        ac_range_index_free(&ranges);
+        return;
+    }
+
+    ac_kernel_client_correlate_scan(
+        &client,
+        &logger,
+        GetCurrentProcessId(),
+        9u,
+        &ranges,
+        &mismatches);
+
+    AC_CHECK(mismatches == 1u);
+    AC_CHECK(client.image_observation_count == 0);
+    AC_CHECK(!client.telemetry_complete);
+    ac_logger_close(&logger);
+    AC_CHECK(ac_test_log_contains(
+        path,
+        "\"event\":\"kernel_user_module_mismatch\""));
+    AC_CHECK(ac_test_log_contains_both(
+        path,
+        "\"event\":\"kernel_user_scan_correlation\"",
+        "\"missing_from_user_snapshot\":1"));
+
+    ac_range_index_free(&ranges);
+    (void)_wremove(path);
 }
 
 typedef void (*AcCoreTestFunction)(void);
@@ -786,7 +916,10 @@ static const AcCoreTestCase g_test_cases[] = {
     {"integrity_patched_text", test_integrity_reports_patched_text_rva},
     {"integrity_module_identity", test_integrity_reports_every_module_identity},
     {"integrity_budget_gap", test_integrity_budget_exhaustion_is_reported},
-    {"driver_protocol_session", test_driver_protocol_session_layout}
+    {"driver_protocol_session", test_driver_protocol_session_layout},
+    {"kernel_sequence_gap", test_kernel_sequence_gap_is_detected},
+    {"kernel_drop_counter", test_kernel_drop_counter_is_monotonic},
+    {"kernel_user_correlation", test_kernel_user_module_correlation}
 };
 
 int main(int argc, char **argv)

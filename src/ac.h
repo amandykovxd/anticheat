@@ -16,7 +16,7 @@
 
 #define AC_AGENT_NAME "anticheat-collector"
 #define AC_AGENT_VERSION "0.3.0"
-#define AC_SCHEMA_VERSION 4u
+#define AC_SCHEMA_VERSION 5u
 
 #define AC_MAX_MODULES 8192u
 #define AC_MAX_SNAPSHOT_RETRIES 16u
@@ -29,6 +29,8 @@
 #define AC_INTEGRITY_MAX_EXPORTS 65536u
 #define AC_INTEGRITY_MAX_IAT_SLOTS 65536u
 #define AC_INTEGRITY_MAX_HOOK_EVENTS 16u
+#define AC_KERNEL_MAX_IMAGE_OBSERVATIONS 256u
+#define AC_KERNEL_MAX_MISMATCH_EVENTS 32u
 
 typedef enum AcSeverity {
     AC_SEVERITY_INFO,
@@ -151,6 +153,7 @@ typedef struct AcScanStats {
     size_t region_events_omitted;
     uint64_t integrity_bytes;
     bool region_scan_truncated;
+    bool coverage_complete;
 } AcScanStats;
 
 typedef struct AcContext {
@@ -177,12 +180,28 @@ typedef struct AcTarget {
     wchar_t *directory;
 } AcTarget;
 
+typedef struct AcKernelImageObservation {
+    uint64_t sequence;
+    uint64_t image_base;
+    uint64_t image_size;
+} AcKernelImageObservation;
+
 typedef struct AcKernelClient {
     HANDLE device;
     AcDriverVersion version;
     uint64_t last_dropped;
+    uint64_t last_sequence;
+    uint64_t sequence_events_missing;
+    uint64_t image_observations_omitted;
     uint64_t session_id;
+    size_t image_observation_count;
+    uint32_t last_callbacks_active;
+    bool callback_state_initialized;
+    bool queue_saturated;
+    bool telemetry_complete;
     bool session_registered;
+    AcKernelImageObservation image_observations[
+        AC_KERNEL_MAX_IMAGE_OBSERVATIONS];
 } AcKernelClient;
 
 bool ac_logger_open(
@@ -200,6 +219,12 @@ void ac_log_event(
     const char *details_json);
 void ac_log_win32_error(
     AcLogger *logger,
+    const char *event,
+    DWORD pid,
+    DWORD error_code);
+void ac_log_win32_error_severity(
+    AcLogger *logger,
+    AcSeverity severity,
     const char *event,
     DWORD pid,
     DWORD error_code);
@@ -257,10 +282,30 @@ bool ac_kernel_client_set_target(AcKernelClient *client, DWORD pid);
 bool ac_kernel_client_get_stats(
     AcKernelClient *client,
     AcDriverStats *stats_out);
+bool ac_kernel_client_observe_sequence(
+    AcKernelClient *client,
+    uint64_t sequence,
+    uint64_t *missing_out);
+bool ac_kernel_client_observe_drop_counter(
+    AcKernelClient *client,
+    uint64_t events_dropped,
+    uint64_t *newly_dropped_out);
+bool ac_kernel_client_process_stats(
+    AcKernelClient *client,
+    AcLogger *logger,
+    DWORD target_pid,
+    const AcDriverStats *stats);
 bool ac_kernel_client_drain(
     AcKernelClient *client,
     AcLogger *logger,
     DWORD target_pid,
     uint64_t *events_out);
+void ac_kernel_client_correlate_scan(
+    AcKernelClient *client,
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t scan_id,
+    const AcRangeIndex *module_ranges,
+    uint64_t *mismatches_out);
 
 #endif

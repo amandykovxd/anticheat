@@ -6,9 +6,18 @@
 for one target PID. It exports a versioned IOCTL interface to one privileged
 user-mode collector.
 
+Protocol version 3 makes queue counters and event sequences session-scoped;
+collectors must reject older drivers for this contract.
+
 The driver does not perform process-memory scanning or enforcement. The
 user-mode collector remains responsible for module inventory, virtual-memory
 classification, JSON serialization, and remote integration.
+
+User-mode scan results are explicitly non-authoritative. The collector
+correlates documented kernel image-load callbacks with user-mode module
+snapshots, but this does not defend against a malicious ring-0 component that
+can falsify both sources. Production deployment must combine the sensor with
+Secure Boot/HVCI posture, driver allowlisting, and remote liveness policy.
 
 ## Components
 
@@ -173,8 +182,9 @@ typedef struct AcDriverStats {
 | `0x1` | Process callback registered. |
 | `0x2` | Image-load callback registered. |
 
-The client must verify `session_id` and monitor `events_dropped`. Any increase
-indicates that the oldest queued event was overwritten.
+The client must verify `session_id`, monitor `events_dropped`, and independently
+validate event sequence continuity. Any drop-counter increase or sequence gap
+invalidates completeness of the session's kernel evidence.
 
 ## Event structure
 
@@ -244,6 +254,10 @@ When the queue is full:
 
 Queue operations and target changes use a spin lock. Callback code copies only
 bounded metadata and does not inspect target address space.
+
+Registering the first target of a new session atomically clears stale queue
+entries and resets the session sequence and counters. Changing the target with
+the same session ID preserves queued evidence and counter continuity.
 
 ## Callback behavior
 
@@ -322,10 +336,14 @@ Use `src/kernel_client.c` as the canonical implementation. It:
 - validates all version and size fields;
 - generates a nonzero session ID with the Windows system RNG;
 - verifies that driver statistics remain bound to that session;
-- drains bounded batches;
+- checks callback health and queue statistics before and after each drain;
+- drains up to 32 bounded batches per pass;
+- rejects duplicate or decreasing driver sequences and reports gaps;
+- correlates kernel image-load bases with the next user-mode module snapshot;
 - converts UTF-16 paths to UTF-8;
 - emits JSONL records;
-- reports queue overflows;
+- reports queue saturation and treats queue overflows as high-severity evidence
+  loss;
 - closes the device on malformed protocol data.
 
 ## Launcher integration
@@ -359,7 +377,7 @@ Client policy:
 | Protocol mismatch | Continue user-mode only. | Exit nonzero. |
 | Target rejected | Continue user-mode only. | Exit nonzero. |
 | Read failure | Close driver, continue. | Close driver, exit nonzero. |
-| Queue overflow | Emit health event, continue. | Emit health event, continue. |
+| Queue overflow | Emit high-severity evidence-loss event; continue. | Emit high-severity evidence-loss event; deployment must reject session evidence. |
 
 An integrator may apply a stricter policy outside the collector.
 

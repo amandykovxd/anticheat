@@ -71,7 +71,7 @@ device so a losing collector can report who won.
 
 ### A4. Blind the driver through the IOCTL interface — *partial*
 
-Protocol v2 requires a nonzero random session ID. A different session cannot
+Protocol v3 requires a nonzero random session ID. A different session cannot
 replace or clear an active registration, and target changes no longer clear the
 queue. Compromise of the collector process still exposes the active session ID
 and device handle, so this does not defend against an equal-privilege attacker
@@ -106,12 +106,15 @@ The driver queue holds 512 events and overwrites the oldest on overflow. An
 attacker who loads and unloads modules in a loop pushes the record of their own
 injection out of the queue before the collector drains it. `events_dropped`
 increases, which is reported as `kernel_event_queue_overflow` at severity
-`medium`.
+`high`. The collector also validates the independent driver sequence and marks
+the session's kernel telemetry incomplete.
 
 Countermeasure: an overflow during a session is evidence destruction, not an
-operational nuisance. It is now `medium` and requires a server-side rule. The
-collector drains every 250 milliseconds while waiting for the next user-mode
-scan, reducing but not eliminating the overflow window.
+operational nuisance. The collector reads statistics outside the ring before
+and after a drain, drains up to 1,024 events per pass before and after every
+scan and every 250 milliseconds while waiting, and exposes cumulative loss in
+`agent_stopped`. A remote policy must reject a session whose
+`kernel_telemetry_complete` is false; no finite local queue closes flooding.
 
 ### B3. Flood user-mode findings — *partial*
 
@@ -229,6 +232,27 @@ another check.
 
 Countermeasure: issue #11's create-suspended launcher sequence. Registration
 must complete before the initial thread resumes.
+
+### C8. Intercept user-mode scan APIs — *partial*
+
+An equal-privilege injector can hook `CreateToolhelp32Snapshot`,
+`VirtualQueryEx`, or `ReadProcessMemory`. A malicious kernel driver can hide or
+forge both user-mode and kernel observations. Moving the same polling loop into
+the driver would add crash and compatibility risk without creating an
+independent trust anchor.
+
+The collector now labels every Windows scan as `source_trust:"untrusted"`,
+sets `complete:false` on structural query, read, module, or integrity gaps, and
+correlates driver image-load bases with the next Toolhelp snapshot. A missing
+base emits `kernel_user_module_mismatch`; this detects some user-mode hiding but
+also occurs for legitimate transient unloads.
+
+Remaining gap: manual-mapped private memory does not trigger the documented
+image-load callback, and a hostile ring-0 component can tamper with both
+sources. Production enforcement therefore requires a signed-driver policy,
+Secure Boot/HVCI posture, remote heartbeat and cross-session correlation. The
+local collector cannot prove its own correctness against a stronger kernel
+attacker.
 
 ---
 

@@ -389,8 +389,9 @@ void ac_log_event(
     LeaveCriticalSection(&logger->lock);
 }
 
-void ac_log_win32_error(
+void ac_log_win32_error_severity(
     AcLogger *logger,
+    AcSeverity severity,
     const char *event,
     DWORD pid,
     DWORD error_code)
@@ -432,5 +433,19 @@ void ac_log_win32_error(
         "{\"win32_error\":%lu,\"message\":\"%s\"}",
         (unsigned long)error_code,
         escaped_message);
-    ac_log_event(logger, AC_SEVERITY_LOW, event, pid, details);
+    ac_log_event(logger, severity, event, pid, details);
+}
+
+void ac_log_win32_error(
+    AcLogger *logger,
+    const char *event,
+    DWORD pid,
+    DWORD error_code)
+{
+    ac_log_win32_error_severity(
+        logger,
+        AC_SEVERITY_LOW,
+        event,
+        pid,
+        error_code);
 }

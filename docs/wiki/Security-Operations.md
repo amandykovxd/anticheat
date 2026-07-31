@@ -14,13 +14,22 @@
 Alert on:
 
 - `kernel_event_queue_overflow`;
+- `kernel_event_sequence_gap`;
+- `kernel_callback_health_degraded`;
+- `kernel_correlation_coverage_gap`;
 - repeated `kernel_event_read_failed`;
+- `kernel_user_module_mismatch` correlated with target lifetime;
+- `scan_completed` with `complete:false`;
 - missing `scan_completed` cadence;
 - process identity mismatch;
 - collector sequence reset during an active session;
 - driver protocol mismatch;
 - complete log-segment deletion or unexpected rotation;
 - collector or driver binary identity changes.
+
+Reject kernel evidence for sessions whose final
+`kernel_telemetry_complete` value is `false`. Do not downgrade queue loss to a
+normal operational warning.
 
 ## Evidence limitations
 

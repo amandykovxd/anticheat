@@ -49,7 +49,10 @@ Reject a session when:
 - an event batch is truncated or misaligned;
 - a required driver request fails;
 - the target process identity changes;
-- kernel queue drops increase without an explicit degraded-mode policy.
+- kernel queue drops increase;
+- the driver sequence has a gap or regression;
+- the callback-health mask differs from the expected value;
+- `kernel_telemetry_complete` is false.
 
 The full ABI is documented in
 [driver-integration.md](https://github.com/amandykovxd/anticheat/blob/main/docs/driver-integration.md).

@@ -277,6 +277,13 @@ static NTSTATUS AcSetTarget(
         KeReleaseSpinLock(&g_extension->lock, old_irql);
         return STATUS_ACCESS_DENIED;
     }
+    if (g_extension->session_id == 0 && request->target_pid != 0) {
+        g_extension->head = 0;
+        g_extension->count = 0;
+        g_extension->next_sequence = 0;
+        g_extension->events_generated = 0;
+        g_extension->events_dropped = 0;
+    }
     g_extension->session_id = request->session_id;
     g_extension->target_pid = request->target_pid;
     if (request->target_pid == 0) {

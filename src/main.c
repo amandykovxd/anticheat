@@ -491,11 +491,15 @@ int wmain(int argc, wchar_t **argv)
     char details[1024];
     uint64_t scan_id = 0;
     uint64_t kernel_events = 0;
+    uint64_t kernel_events_dropped = 0;
+    uint64_t kernel_sequence_events_missing = 0;
+    uint64_t kernel_module_mismatches = 0;
     size_t root_count = 0;
     size_t root_index;
     bool exit_now = false;
     bool context_ready = false;
     bool kernel_ready = false;
+    bool kernel_telemetry_complete = true;
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
@@ -664,6 +668,7 @@ int wmain(int argc, wchar_t **argv)
                 "kernel_driver_open_failed",
                 target.pid,
                 kernel_error);
+            kernel_telemetry_complete = false;
             if (options.require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
@@ -684,6 +689,7 @@ int wmain(int argc, wchar_t **argv)
                 "kernel_target_registration_failed",
                 target.pid,
                 kernel_error);
+            kernel_telemetry_complete = false;
             ac_kernel_client_close(&kernel_client);
             if (options.require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
@@ -714,6 +720,7 @@ int wmain(int argc, wchar_t **argv)
         AcScanStats stats;
         HANDLE wait_handles[2];
         DWORD wait_result;
+        bool scan_succeeded;
 
         if (ac_stop_requested()) {
             exit_code = AC_EXIT_OK;
@@ -726,8 +733,13 @@ int wmain(int argc, wchar_t **argv)
                 &logger,
                 target.pid,
                 &kernel_events)) {
-            ac_log_win32_error(
+            kernel_telemetry_complete = false;
+            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_sequence_events_missing =
+                kernel_client.sequence_events_missing;
+            ac_log_win32_error_severity(
                 &logger,
+                AC_SEVERITY_HIGH,
                 "kernel_event_read_failed",
                 target.pid,
                 GetLastError());
@@ -737,10 +749,22 @@ int wmain(int argc, wchar_t **argv)
                 exit_code = AC_EXIT_INTERNAL;
                 break;
             }
+        } else if (kernel_ready) {
+            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_sequence_events_missing =
+                kernel_client.sequence_events_missing;
+            kernel_telemetry_complete =
+                kernel_telemetry_complete &&
+                kernel_client.telemetry_complete;
         }
 
         ++scan_id;
-        if (!ac_scan_process(&context, &target, scan_id, &stats)) {
+        scan_succeeded = ac_scan_process(
+            &context,
+            &target,
+            scan_id,
+            &stats);
+        if (!scan_succeeded) {
             const DWORD error = GetLastError();
 
             if (WaitForSingleObject(target.process, 0) == WAIT_OBJECT_0) {
@@ -749,6 +773,46 @@ int wmain(int argc, wchar_t **argv)
                 break;
             }
             ac_log_win32_error(&logger, "scan_failed", target.pid, error);
+        }
+
+        if (kernel_ready &&
+            !ac_kernel_client_drain(
+                &kernel_client,
+                &logger,
+                target.pid,
+                &kernel_events)) {
+            kernel_telemetry_complete = false;
+            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_sequence_events_missing =
+                kernel_client.sequence_events_missing;
+            ac_log_win32_error_severity(
+                &logger,
+                AC_SEVERITY_HIGH,
+                "kernel_event_read_failed",
+                target.pid,
+                GetLastError());
+            ac_kernel_client_close(&kernel_client);
+            kernel_ready = false;
+            if (options.require_kernel) {
+                exit_code = AC_EXIT_INTERNAL;
+                break;
+            }
+        } else if (kernel_ready) {
+            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_sequence_events_missing =
+                kernel_client.sequence_events_missing;
+            if (scan_succeeded) {
+                ac_kernel_client_correlate_scan(
+                    &kernel_client,
+                    &logger,
+                    target.pid,
+                    scan_id,
+                    &context.module_ranges,
+                    &kernel_module_mismatches);
+            }
+            kernel_telemetry_complete =
+                kernel_telemetry_complete &&
+                kernel_client.telemetry_complete;
         }
 
         if (options.once) {
@@ -790,8 +854,13 @@ int wmain(int argc, wchar_t **argv)
                         &logger,
                         target.pid,
                         &kernel_events)) {
-                    ac_log_win32_error(
+                    kernel_telemetry_complete = false;
+                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_sequence_events_missing =
+                        kernel_client.sequence_events_missing;
+                    ac_log_win32_error_severity(
                         &logger,
+                        AC_SEVERITY_HIGH,
                         "kernel_event_read_failed",
                         target.pid,
                         GetLastError());
@@ -801,6 +870,13 @@ int wmain(int argc, wchar_t **argv)
                         exit_code = AC_EXIT_INTERNAL;
                         goto cleanup;
                     }
+                } else if (kernel_ready) {
+                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_sequence_events_missing =
+                        kernel_client.sequence_events_missing;
+                    kernel_telemetry_complete =
+                        kernel_telemetry_complete &&
+                        kernel_client.telemetry_complete;
                 }
             }
 
@@ -811,11 +887,29 @@ int wmain(int argc, wchar_t **argv)
 
         if (wait_result == WAIT_OBJECT_0) {
             if (kernel_ready) {
-                (void)ac_kernel_client_drain(
-                    &kernel_client,
-                    &logger,
-                    target.pid,
-                    &kernel_events);
+                if (ac_kernel_client_drain(
+                        &kernel_client,
+                        &logger,
+                        target.pid,
+                        &kernel_events)) {
+                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_sequence_events_missing =
+                        kernel_client.sequence_events_missing;
+                    kernel_telemetry_complete =
+                        kernel_telemetry_complete &&
+                        kernel_client.telemetry_complete;
+                } else {
+                    kernel_telemetry_complete = false;
+                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_sequence_events_missing =
+                        kernel_client.sequence_events_missing;
+                    ac_log_win32_error_severity(
+                        &logger,
+                        AC_SEVERITY_HIGH,
+                        "kernel_event_read_failed",
+                        target.pid,
+                        GetLastError());
+                }
             }
             ac_log_event(&logger, AC_SEVERITY_INFO, "target_exited", target.pid, "{}");
             exit_code = AC_EXIT_OK;
@@ -837,10 +931,20 @@ cleanup:
         sizeof(details),
         "{\"scans\":%" PRIu64 ",\"terminated_target\":false,"
         "\"kernel_events\":%" PRIu64 ","
+        "\"kernel_events_dropped\":%" PRIu64 ","
+        "\"kernel_sequence_events_missing\":%" PRIu64 ","
+        "\"kernel_module_mismatches\":%" PRIu64 ","
+        "\"kernel_telemetry_complete\":%s,"
         "\"log_write_failures\":%" PRIu64 ",\"log_truncated_lines\":%" PRIu64 ","
         "\"exit_code\":%d}",
         scan_id,
         kernel_events,
+        kernel_events_dropped,
+        kernel_sequence_events_missing,
+        kernel_module_mismatches,
+        (options.kernel_telemetry && kernel_telemetry_complete)
+            ? "true"
+            : "false",
         logger.write_failures,
         logger.truncated_lines,
         exit_code);

@@ -42,6 +42,11 @@ The collector validates process identity, opens the target with read-only
 process rights, inventories loader-visible modules, maps executable virtual
 memory, and emits classified findings.
 
+The Win32 module, virtual-memory, and read APIs are not a trusted security
+boundary. Scan records identify this source as untrusted. Kernel image-load
+bases are correlated with the next module snapshot so cross-source omissions
+remain visible, subject to legitimate unload races.
+
 The collector does not request process write, operation, terminate, or
 remote-thread rights.
 
@@ -56,6 +61,10 @@ Integrators own:
 - server-issued session identity;
 - signal correlation and enforcement policy;
 - compatibility and false-positive qualification.
+
+A hostile kernel driver can manipulate both callback and user-mode views. The
+architecture raises attacker cost but does not claim local authority against a
+same-ring adversary.
 
 See the repository
 [security model](https://github.com/amandykovxd/anticheat/blob/main/SECURITY.md)

@@ -58,8 +58,9 @@ integrator-owned correlation and policy
 
 The driver and collector use the shared ABI defined in
 [`include/ac_driver_protocol.h`](include/ac_driver_protocol.h). The driver
-device is exclusive and accessible only to `SYSTEM`. Protocol v2 binds target
-registration to a cryptographically random collector session identifier.
+device is exclusive and accessible only to `SYSTEM`. Protocol v3 binds target
+registration to a cryptographically random collector session identifier and
+uses session-scoped queue counters and sequence numbers.
 
 ## Supported configurations
 
@@ -122,13 +123,13 @@ core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer
 
 ### Automated test inventory
 
-Windows builds register 37 independent CTest cases: 17 portable algorithms,
-16 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
+Windows builds register 40 independent CTest cases: 17 portable algorithms,
+19 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
 macOS builds register 23 cases: 17 portable cases, 3 CLI contracts, one live
 self-scan, one suspicious-region integration test, and the transport suite.
 Linux sanitizer builds register 18 cases:
 17 portable cases and the transport suite. The transport CTest entry contains
-21 protocol, persistence, tamper, authentication, rotation, and backpressure
+22 protocol, persistence, tamper, authentication, rotation, and backpressure
 tests.
 
 List the registered cases without executing them:
@@ -146,7 +147,7 @@ ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 
 The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
 `transport`, and `integration`. The Windows CI matrix rejects a configuration
-that does not expose exactly 37 independent CTest entries.
+that does not expose exactly 40 independent CTest entries.
 
 ## Build and run on macOS
 
@@ -375,8 +376,8 @@ The output is a stable, line-oriented contract:
 
 ```text
 collector_version=0.3.0
-event_schema_version=4
-driver_protocol_version=2
+event_schema_version=5
+driver_protocol_version=3
 ```
 
 Integrators must parse the keys rather than depend on a fixed numeric value.
@@ -431,7 +432,12 @@ Kernel-originated records contain the driver's independent sequence number and
 - `kernel_process_created`;
 - `kernel_process_exited`;
 - `kernel_image_loaded`;
+- `kernel_event_queue_saturated`;
 - `kernel_event_queue_overflow`;
+- `kernel_event_sequence_gap`;
+- `kernel_callback_health_degraded`;
+- `kernel_user_module_mismatch`;
+- `kernel_user_scan_correlation`;
 - `kernel_event_read_failed`.
 
 The complete schema is defined in
@@ -449,12 +455,14 @@ python tools\verify_log.py `
 ## Operational constraints
 
 - The driver queue contains 512 events and overwrites the oldest event when
-  full. Every overwrite increments `events_dropped`.
-- A read returns at most 32 events. The collector drains at most eight batches
-  every 250 milliseconds while waiting for the next user-mode scan.
+  full. Every overwrite increments the session-scoped `events_dropped` counter.
+  Any increase is a high-severity loss-of-evidence event.
+- A read returns at most 32 events. The collector drains at most 32 batches per
+  pass before and after each scan and every 250 milliseconds while waiting.
 - Only one device handle is allowed at a time.
-- Target changes preserve queued evidence. A different session ID cannot replace
-  or clear an active registration.
+- A new authenticated session starts with an empty queue and sequence 1. Target
+  changes inside that session preserve queued evidence. A different session ID
+  cannot replace or clear an active registration.
 - Target registration is PID-based. The collector separately validates target
   image path and process creation time.
 - The driver reports image loads for the active PID, direct child-process
@@ -463,8 +471,10 @@ python tools\verify_log.py `
   contents.
 - The driver does not enumerate image mappings that occurred before target
   registration.
-- The user-mode scanner still provides the current module and executable-memory
-  view.
+- The user-mode scanner provides a non-authoritative current module and
+  executable-memory view. Every completion record identifies Win32 API as an
+  untrusted source. Kernel image-load observations are correlated with the next
+  user-mode module snapshot and mismatches are emitted separately.
 - Driver unload unregisters callbacks before deleting the device object.
 - The current driver is a development WDM implementation. Production release
   requires Driver Verifier, HLK/signing validation, upgrade testing, crash-dump

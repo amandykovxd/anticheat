@@ -47,8 +47,12 @@ The receiver should:
 - index by session and collector sequence;
 - retain kernel sequence independently;
 - detect missing or reordered records;
+- invalidate kernel evidence on queue drops, sequence gaps, or callback-health
+  degradation;
+- correlate kernel image bases with user-mode module snapshots while retaining
+  the documented unload-race caveat;
 - anchor chain heads in append-only remote storage;
-- alert on queue drops and missing scan cadence;
+- alert on queue drops, incomplete scans, and missing scan cadence;
 - keep client signals separate from enforcement decisions.
 
 See the canonical

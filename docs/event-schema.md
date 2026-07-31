@@ -1,6 +1,10 @@
 # Event Schema
 
-Schema version: `4` (`AC_SCHEMA_VERSION`).
+Schema version: `5` (`AC_SCHEMA_VERSION`).
+
+Schema 5 adds explicit kernel evidence-loss, callback-health, sequence-gap,
+kernel/user correlation, and user-mode source-trust fields. The reference
+transport accepts both schema 4 and schema 5 during migration.
 
 The collector writes UTF-8 JSON Lines. Each line contains one complete JSON
 object followed by `LF`. The writer flushes each record before writing the
@@ -193,6 +197,10 @@ Fields:
 
 - `scans`;
 - `kernel_events`;
+- `kernel_events_dropped`;
+- `kernel_sequence_events_missing`;
+- `kernel_module_mismatches`;
+- `kernel_telemetry_complete`;
 - `terminated_target`: always `false`;
 - `log_write_failures`;
 - `log_truncated_lines`;
@@ -284,20 +292,77 @@ Driver event flags:
 
 ### `kernel_event_queue_overflow`
 
-Severity: `medium`.
+Severity: `high`.
 
 Fields:
 
 - `events_dropped`: cumulative overwritten-event count;
 - `newly_dropped`: increase since the previous statistics read;
 - `queue_depth`;
-- `queue_capacity`.
+- `queue_capacity`;
+- `telemetry_complete`: `false`;
+- `possible_attack`: `event_flooding`;
+- `required_action`: `invalidate_session_evidence`.
 
-The driver overwrites the oldest event when the fixed queue is full.
+The driver overwrites the oldest event when the fixed queue is full. The
+counter is read through `IOCTL_AC_GET_STATS`, independently of the event queue,
+before and after every drain pass. Any increase means the kernel event stream
+for that session is incomplete.
+
+### `kernel_event_queue_saturated`
+
+Severity: `medium`.
+
+The queue reached its capacity but the statistics read has not yet observed an
+increase in `events_dropped`. This is an early pressure signal, not proof that
+evidence was lost.
+
+### `kernel_event_sequence_gap`
+
+Severity: `high`.
+
+Fields:
+
+- `expected_sequence`;
+- `observed_sequence`;
+- `events_missing`;
+- `telemetry_complete`: `false`.
+
+The collector validates the driver's independent session sequence in addition
+to the drop counter. Duplicate or decreasing sequences are rejected as
+malformed protocol data.
+
+### `kernel_callback_health_degraded`
+
+Severity: `high`.
+
+The driver statistics callback mask differs from `3`, which means the process
+or image-load callback is inactive. A transition back to the expected mask is
+reported as `kernel_callback_health_restored`.
+
+### `kernel_user_module_mismatch`
+
+Severity: `medium`.
+
+A kernel image-load callback reported an image base that was absent from the
+next Toolhelp module snapshot. Valid short-lived loads can produce this event;
+it can also indicate user-mode API interception or module hiding. Consumers
+must correlate it with lifetime and policy data before enforcement.
+
+### `kernel_user_scan_correlation`
+
+Severity: `info`.
+
+Summary fields include `kernel_images_observed`,
+`visible_in_user_snapshot`, `missing_from_user_snapshot`,
+`observations_omitted`, and `user_mode_trust`.
+
+`kernel_correlation_coverage_gap` is high severity when the bounded
+observation or mismatch-report capacity is exceeded.
 
 ### `kernel_event_read_failed`
 
-Severity: `low`.
+Severity: `high`.
 
 The IOCTL read or statistics request failed, or the returned protocol data was
 malformed. The collector closes the driver handle after this record.
@@ -343,6 +408,9 @@ Fields:
 | `region_scan_truncated` | boolean |
 | `integrity_bytes` | unsigned integer |
 | `integrity_baselines` | unsigned integer |
+| `complete` | boolean |
+| `source` | `user_mode_win32_api` |
+| `source_trust` | `untrusted` |
 
 Consumers should monitor the expected event cadence. Missing
 `scan_completed` records indicate a stopped collector, blocked collector, or
@@ -355,14 +423,22 @@ indicates that module validation is disabled or permanently budget-starved.
 
 Severity: `medium`.
 
-Emitted whenever a module or region cap prevents a complete scan. Fields:
+Emitted whenever a module, region, memory-read, query, or integrity condition
+prevents a structurally complete scan. Fields:
 
 - `scan_id`;
 - `module_list_truncated`;
+- `module_snapshot_empty`;
 - `region_scan_truncated`;
 - `region_events_omitted`;
+- `query_failures`;
+- `read_failures`;
+- `integrity_disabled`;
+- `integrity_modules_unavailable`;
+- `integrity_unreadable_blocks`;
 - `integrity_modules_partial`;
 - `integrity_modules_skipped`;
+- `possible_user_mode_api_interference`;
 - `reason`: `scan_coverage_incomplete`.
 
 ### `scan_budget_exceeded`
