@@ -3,7 +3,7 @@ Signature="$WINDOWS NT$"
 Class=System
 ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderName%
-DriverVer=07/28/2026,0.3.0.0
+DriverVer=07/31/2026,0.4.0.0
 CatalogFile=AcTelemetry.cat
 PnpLockdown=1
 

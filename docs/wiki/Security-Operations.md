@@ -2,7 +2,8 @@
 
 ## Deployment controls
 
-- Run the kernel-enabled collector as `SYSTEM` or local Administrator.
+- Run the kernel-enabled collector as `SYSTEM`; the device ACL does not grant
+  access to a normal local Administrator token.
 - Restrict log directories to the collector and forwarding service.
 - Sign driver packages outside source control and general CI workers.
 - Retain release hashes, symbols, INF, catalog, and signing evidence.
@@ -19,6 +20,10 @@ Alert on:
 - `kernel_correlation_coverage_gap`;
 - repeated `kernel_event_read_failed`;
 - `kernel_user_module_mismatch` correlated with target lifetime;
+- `kernel_process_handle_requested` correlated with requestor identity;
+- `kernel_thread_start_unlinked`;
+- `module_manifest_violation` and `kernel_driver_manifest_violation`;
+- configured dispatch or VMT target violations;
 - `scan_completed` with `complete:false`;
 - missing `scan_completed` cadence;
 - process identity mismatch;

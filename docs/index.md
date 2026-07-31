@@ -26,6 +26,7 @@ enforcement.
 - [Event schema](event-schema.html)
 - [Adversarial analysis](adversarial-analysis.html)
 - [DragonBurn defensive analysis](dragonburn-threat-analysis.html)
+- [Public CS2 cheat defensive analysis](public-cs2-cheat-analysis.html)
 - [Engineering project contract](project-board.html)
 
 ## Engineering coordination
@@ -39,7 +40,7 @@ enforcement.
 
 ## Build status
 
-[Windows x64, Win32, and sanitizer CI](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml)
+[Windows driver/x64/Win32, macOS, Linux, and sanitizer CI](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml)
 and
 [CodeQL C/C++ analysis](https://github.com/amandykovxd/anticheat/actions/workflows/codeql.yml)
 run on changes to the protected `main` branch and on pull requests.

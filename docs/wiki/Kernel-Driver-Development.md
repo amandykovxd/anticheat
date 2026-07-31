@@ -2,10 +2,12 @@
 
 ## Toolchain
 
-Use Visual Studio 2022 with matching Windows SDK and WDK build numbers.
+Use Visual Studio 2022 with Desktop C++ support. The project pins the x64 WDK
+NuGet package so CI and local builds restore the same WDK/SDK dependency set.
 
 ```powershell
 msbuild driver\AcTelemetry.vcxproj `
+  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```

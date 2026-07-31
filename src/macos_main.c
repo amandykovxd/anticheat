@@ -16,9 +16,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AC_AGENT_VERSION "0.3.0"
+#define AC_AGENT_VERSION "0.4.0"
 #define AC_SCHEMA_VERSION 5u
-#define AC_DRIVER_PROTOCOL_VERSION 3u
+#define AC_DRIVER_PROTOCOL_VERSION 4u
 #define AC_MAX_REGION_EVENTS 64u
 
 typedef struct AcMacLogger {

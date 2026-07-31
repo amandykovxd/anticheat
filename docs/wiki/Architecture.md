@@ -17,6 +17,8 @@ anticheat.exe
 AcTelemetry.sys
   process callbacks
   image-load callbacks
+  thread callbacks
+  process-handle callbacks (telemetry only)
   bounded nonpaged event queue
         |
         v
@@ -28,9 +30,10 @@ integrator transport, storage, correlation, and policy
 
 ## Kernel boundary
 
-The driver registers documented process and image-load callbacks for one
-active target PID. It stores fixed-size records in a preallocated queue and
-does not perform target-memory scanning in callback context.
+The driver registers documented process, image-load, thread, and Object
+Manager process-handle callbacks for one active target PID. It stores
+fixed-size records in a preallocated queue and does not perform target-memory
+scanning or access downgrading in callback context.
 
 The device is exclusive and restricted to `SYSTEM`. Target registration is
 bound to a random protocol session ID. All requests use fixed-size structures

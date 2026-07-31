@@ -2,12 +2,13 @@
 
 ## Purpose
 
-`AcTelemetry.sys` provides kernel-originated process and image-load telemetry
-for one target PID. It exports a versioned IOCTL interface to one privileged
-user-mode collector.
+`AcTelemetry.sys` provides kernel-originated process, image-load, thread
+lifecycle, and foreign process-handle telemetry for one target PID. It exports
+a versioned IOCTL interface to one privileged user-mode collector.
 
-Protocol version 3 makes queue counters and event sequences session-scoped;
-collectors must reject older drivers for this contract.
+Protocol version 4 makes queue counters and event sequences session-scoped and
+adds telemetry-only process-handle and thread lifecycle events. Collectors
+must reject older drivers for this contract.
 
 The driver does not perform process-memory scanning or enforcement. The
 user-mode collector remains responsible for module inventory, virtual-memory
@@ -56,7 +57,7 @@ class GUID.
 Current protocol:
 
 ```c
-#define AC_DRIVER_PROTOCOL_VERSION 2u
+#define AC_DRIVER_PROTOCOL_VERSION 4u
 ```
 
 The following structure sizes are part of the ABI:
@@ -181,6 +182,8 @@ typedef struct AcDriverStats {
 | --- | --- |
 | `0x1` | Process callback registered. |
 | `0x2` | Image-load callback registered. |
+| `0x4` | Thread callback registered. |
+| `0x8` | Process-handle callback registered. |
 
 The client must verify `session_id`, monitor `events_dropped`, and independently
 validate event sequence continuity. Any drop-counter increase or sequence gap
@@ -216,12 +219,12 @@ Field contract:
 | `timestamp_100ns` | Kernel system time in 100-nanosecond intervals. |
 | `type` | `AcDriverEventType`. |
 | `flags` | Path and image classification flags. |
-| `process_id` | Target PID. |
-| `parent_process_id` | Parent PID for process creation. |
-| `status` | NTSTATUS where applicable. |
-| `reserved` | Zero. |
-| `image_base` | 64-bit image base representation. |
-| `image_size` | Mapped image size. |
+| `process_id` | Event-specific process or requestor PID. |
+| `parent_process_id` | Parent, target, or thread ID according to event type. |
+| `status` | NTSTATUS or operation code where applicable. |
+| `reserved` | Creator PID for thread events; otherwise zero. |
+| `image_base` | Image base, thread start address, or original requested access. |
+| `image_size` | Mapped image size or observed requested access. |
 | `image_path` | Null-terminated UTF-16 path, bounded to 259 characters. |
 
 Event types:
@@ -232,6 +235,9 @@ Event types:
 | `2` | `PROCESS_CREATED` | Process callback. |
 | `3` | `PROCESS_EXITED` | Process callback. |
 | `4` | `IMAGE_LOADED` | Image-load callback. |
+| `5` | `PROCESS_HANDLE` | Object Manager process-handle callback. |
+| `6` | `THREAD_CREATED` | Thread callback. |
+| `7` | `THREAD_EXITED` | Thread callback. |
 
 Flags:
 
@@ -240,6 +246,8 @@ Flags:
 | `0x00000001` | `PATH_TRUNCATED` |
 | `0x00000002` | `SYSTEM_IMAGE` |
 | `0x00000004` | `PATH_UNAVAILABLE` |
+| `0x00000008` | `HANDLE_DUPLICATE` |
+| `0x00000010` | `KERNEL_HANDLE` |
 
 ## Queue behavior
 
@@ -295,14 +303,31 @@ The callback records:
 
 The callback does not map, read, or modify user memory.
 
+### Thread callback
+
+Registered with `PsSetCreateThreadNotifyRoutine`. It emits target thread IDs
+and the callback-context PID. The kernel callback does not query user memory.
+The collector resolves `ThreadQuerySetWin32StartAddress` and correlates the
+result with its next module range snapshot. A short-lived thread can exit
+before that query; this is reported as unavailable coverage.
+
+### Process-handle callback
+
+Registered with `ObRegisterCallbacks` for process handle creation and
+duplication. It records foreign requests containing termination, remote-thread,
+VM read/write/operation, duplicate-handle, or suspend/resume rights. The
+callback returns `OB_PREOP_SUCCESS` without changing `DesiredAccess`.
+
 ### Unload
 
 Unload order:
 
-1. remove image-load callback;
-2. remove process callback;
-3. delete symbolic link;
-4. delete device object.
+1. unregister the Object Manager callback;
+2. remove the thread callback;
+3. remove the image-load callback;
+4. remove the process callback;
+5. delete symbolic link;
+6. delete device object.
 
 The driver must not be unloaded while an integration continues to require
 kernel telemetry.
@@ -340,6 +365,8 @@ Use `src/kernel_client.c` as the canonical implementation. It:
 - drains up to 32 bounded batches per pass;
 - rejects duplicate or decreasing driver sequences and reports gaps;
 - correlates kernel image-load bases with the next user-mode module snapshot;
+- resolves and correlates target thread start addresses;
+- resolves requestor process paths for dangerous handle requests;
 - converts UTF-16 paths to UTF-8;
 - emits JSONL records;
 - reports queue saturation and treats queue overflows as high-severity evidence
@@ -387,6 +414,7 @@ Build:
 
 ```powershell
 msbuild driver\AcTelemetry.vcxproj `
+  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```
@@ -401,7 +429,7 @@ Package contents:
 
 Production requirements:
 
-- matching SDK and WDK;
+- the pinned WDK NuGet package and its matching SDK dependency;
 - release driver signature;
 - catalog signature;
 - INF validation;

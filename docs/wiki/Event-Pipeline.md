@@ -7,6 +7,8 @@ Kernel-originated records:
 - target registration changes;
 - target and direct-child process lifecycle;
 - image loads for the active target;
+- target thread lifecycle and start-address correlation;
+- foreign process-handle requests containing dangerous access;
 - queue drop and callback health counters.
 
 User-mode records:
@@ -15,6 +17,8 @@ User-mode records:
 - module inventory;
 - executable regions outside loader-visible module ranges;
 - module path and hash classification;
+- pinned module and driver manifest violations;
+- configured function-pointer, VMT, and target-WndProc validation;
 - scan budgets and completion cadence;
 - driver connection and protocol failures.
 

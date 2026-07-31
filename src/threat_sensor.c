@@ -1,19 +1,31 @@
 #include "ac.h"
 
 #include <inttypes.h>
+#include <psapi.h>
 #include <stdlib.h>
 #include <string.h>
 #include <tlhelp32.h>
+#include <winternl.h>
 #include <wchar.h>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011u
 #endif
 
-#define AC_THREAT_INDICATOR_SET "dragonburn-stable-6c718998"
+#define AC_THREAT_INDICATOR_SET \
+    "dragonburn-6c718998_valthrun-ac08b2d7"
 #define AC_DEVICE_BUFFER_INITIAL 65536u
 #define AC_DEVICE_BUFFER_MAX 1048576u
 #define AC_OVERLAY_MIN_OVERLAP_PER_MILLE 850u
+#define AC_NATIVE_DEVICE_BUFFER_SIZE 65536u
+#define AC_DRIVER_SNAPSHOT_INITIAL 256u
+#define AC_DRIVER_SNAPSHOT_MAX 4096u
+#define AC_STATUS_NO_MORE_ENTRIES ((LONG)0x8000001aL)
+
+typedef struct AcObjectDirectoryInformation {
+    UNICODE_STRING name;
+    UNICODE_STRING type_name;
+} AcObjectDirectoryInformation;
 
 typedef struct AcTargetWindowSearch {
     DWORD target_pid;
@@ -115,6 +127,12 @@ const char *ac_known_threat_device_indicator(
             *severity_out = AC_SEVERITY_MEDIUM;
         }
         return "intel_vulnerable_driver_device";
+    }
+    if (_wcsicmp(device_name, L"valthrun") == 0) {
+        if (severity_out != NULL) {
+            *severity_out = AC_SEVERITY_HIGH;
+        }
+        return "valthrun_native_kernel_device";
     }
     return NULL;
 }
@@ -227,6 +245,236 @@ void ac_threat_sensor_report_posture(
         target_pid,
         details);
     sensor->posture_reported = true;
+}
+
+static bool ac_normalize_driver_path(
+    const wchar_t *source,
+    wchar_t *destination,
+    size_t destination_count)
+{
+    if (source == NULL || destination == NULL || destination_count == 0) {
+        return false;
+    }
+
+    if (_wcsnicmp(source, L"\\SystemRoot", 11u) == 0) {
+        wchar_t windows_directory[MAX_PATH];
+        const UINT length = GetWindowsDirectoryW(
+            windows_directory,
+            (UINT)(sizeof(windows_directory) /
+                   sizeof(windows_directory[0])));
+        if (length == 0 || length >=
+            (UINT)(sizeof(windows_directory) /
+                   sizeof(windows_directory[0]))) {
+            return false;
+        }
+        return swprintf_s(
+            destination,
+            destination_count,
+            L"%ls%ls",
+            windows_directory,
+            source + 11u) > 0;
+    }
+
+    if (wcsncmp(source, L"\\??\\", 4u) == 0) {
+        source += 4u;
+    }
+    return wcscpy_s(destination, destination_count, source) == 0;
+}
+
+void ac_threat_sensor_report_driver_snapshot(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid,
+    const AcManifest *manifest)
+{
+    LPVOID *drivers = NULL;
+    DWORD capacity = AC_DRIVER_SNAPSHOT_INITIAL;
+    DWORD bytes_needed = 0;
+    size_t driver_count = 0;
+    size_t paths_available = 0;
+    size_t hashes_available = 0;
+    bool complete = false;
+    DWORD index;
+
+    if (sensor == NULL || logger == NULL ||
+        sensor->driver_snapshot_reported) {
+        return;
+    }
+    sensor->driver_snapshot_reported = true;
+
+    while (capacity <= AC_DRIVER_SNAPSHOT_MAX) {
+        LPVOID *candidate = (LPVOID *)realloc(
+            drivers,
+            (size_t)capacity * sizeof(*drivers));
+        if (candidate == NULL) {
+            break;
+        }
+        drivers = candidate;
+        if (!EnumDeviceDrivers(
+                drivers,
+                capacity * (DWORD)sizeof(*drivers),
+                &bytes_needed)) {
+            break;
+        }
+        if (bytes_needed <= capacity * (DWORD)sizeof(*drivers)) {
+            driver_count = bytes_needed / sizeof(*drivers);
+            complete = true;
+            break;
+        }
+        capacity = bytes_needed / (DWORD)sizeof(*drivers) + 32u;
+    }
+
+    for (index = 0; index < (DWORD)driver_count; ++index) {
+        wchar_t kernel_path[1024];
+        wchar_t file_path[1024];
+        char path_utf8[3072];
+        char escaped_path[6144];
+        char digest[AC_SHA256_HEX_SIZE];
+        char details[6656];
+        uint64_t file_size = 0;
+        bool hash_available = false;
+        const DWORD path_length = GetDeviceDriverFileNameW(
+            drivers[index],
+            kernel_path,
+            (DWORD)(sizeof(kernel_path) / sizeof(kernel_path[0])));
+
+        if (path_length == 0 || path_length >=
+            (DWORD)(sizeof(kernel_path) / sizeof(kernel_path[0]))) {
+            continue;
+        }
+        ++paths_available;
+        if (!ac_normalize_driver_path(
+                kernel_path,
+                file_path,
+                sizeof(file_path) / sizeof(file_path[0]))) {
+            (void)wcscpy_s(
+                file_path,
+                sizeof(file_path) / sizeof(file_path[0]),
+                kernel_path);
+        }
+        hash_available = ac_hash_file(file_path, digest, &file_size);
+        if (hash_available) {
+            ++hashes_available;
+        }
+        if (!ac_wide_to_utf8(
+                file_path,
+                path_utf8,
+                sizeof(path_utf8))) {
+            (void)strcpy_s(
+                path_utf8,
+                sizeof(path_utf8),
+                "<conversion-failed>");
+        }
+        (void)ac_json_escape(
+            path_utf8,
+            escaped_path,
+            sizeof(escaped_path));
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"image_base\":\"0x%" PRIxPTR
+            "\",\"path\":\"%s\",\"file_sha256\":%s%s%s,"
+            "\"file_size\":%" PRIu64
+            ",\"source\":\"psapi_startup_snapshot\","
+            "\"verdict\":\"manifest_input\"}",
+            (uintptr_t)drivers[index],
+            escaped_path,
+            hash_available ? "\"" : "null",
+            hash_available ? digest : "",
+            hash_available ? "\"" : "",
+            file_size);
+        ac_log_event(
+            logger,
+            AC_SEVERITY_INFO,
+            "loaded_kernel_driver_observed",
+            target_pid,
+            details);
+
+        if (manifest != NULL && manifest->trusted) {
+            const AcManifestMatch match = hash_available
+                ? ac_manifest_match_hex(
+                    manifest,
+                    AC_MANIFEST_DRIVER,
+                    file_path,
+                    digest)
+                : AC_MANIFEST_HASH_MISMATCH;
+            if (match != AC_MANIFEST_AUTHORIZED) {
+                (void)snprintf(
+                    details,
+                    sizeof(details),
+                    "{\"image_base\":\"0x%" PRIxPTR
+                    "\",\"path\":\"%s\",\"file_sha256\":%s%s%s,"
+                    "\"manifest_sha256\":\"%s\",\"reason\":\"%s\","
+                    "\"verdict\":\"signal_only\"}",
+                    (uintptr_t)drivers[index],
+                    escaped_path,
+                    hash_available ? "\"" : "null",
+                    hash_available ? digest : "",
+                    hash_available ? "\"" : "",
+                    manifest->file_sha256,
+                    !hash_available
+                        ? "driver_hash_unavailable"
+                        : match == AC_MANIFEST_HASH_MISMATCH
+                            ? "manifest_hash_mismatch"
+                            : "driver_not_in_manifest");
+                ac_log_event(
+                    logger,
+                    hash_available
+                        ? AC_SEVERITY_HIGH : AC_SEVERITY_MEDIUM,
+                    "kernel_driver_manifest_violation",
+                    target_pid,
+                    details);
+            }
+        }
+    }
+
+    if (driver_count == 0 || paths_available != driver_count) {
+        complete = false;
+    }
+
+    {
+        char details[512];
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"drivers_observed\":%zu,\"paths_available\":%zu,"
+            "\"hashes_available\":%zu,\"complete\":%s,"
+            "\"source\":\"psapi_startup_snapshot\","
+            "\"requires_pinned_manifest\":true}",
+            driver_count,
+            paths_available,
+            hashes_available,
+            complete ? "true" : "false");
+        ac_log_event(
+            logger,
+            complete ? AC_SEVERITY_INFO : AC_SEVERITY_MEDIUM,
+            "loaded_kernel_driver_snapshot_completed",
+            target_pid,
+            details);
+    }
+    free(drivers);
+}
+
+void ac_threat_sensor_report_input_posture(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid)
+{
+    if (sensor == NULL || logger == NULL || sensor->input_posture_reported) {
+        return;
+    }
+
+    ac_log_event(
+        logger,
+        AC_SEVERITY_MEDIUM,
+        "input_provenance_posture",
+        target_pid,
+        "{\"direct_packet_attribution\":false,"
+        "\"documented_windows_api_available\":false,"
+        "\"kernel_driver_manifest_correlation\":true,"
+        "\"raw_input_behavior_correlation_required\":true,"
+        "\"verdict\":\"capability_gap\"}");
+    sensor->input_posture_reported = true;
 }
 
 static bool ac_emit_indicator(
@@ -415,6 +663,149 @@ static void ac_scan_device_indicators(
 
     stats->device_inventory_complete = true;
     free(buffer);
+}
+
+static bool ac_unicode_string_equals(
+    const UNICODE_STRING *value,
+    const wchar_t *expected)
+{
+    const size_t expected_length = expected != NULL ? wcslen(expected) : 0;
+
+    return value != NULL && value->Buffer != NULL &&
+           value->Length == expected_length * sizeof(wchar_t) &&
+           _wcsnicmp(
+               value->Buffer,
+               expected,
+               expected_length) == 0;
+}
+
+static void ac_scan_native_device_indicators(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t scan_id,
+    AcThreatScanStats *stats)
+{
+    typedef LONG (NTAPI *AcNtOpenDirectoryObject)(
+        PHANDLE,
+        ACCESS_MASK,
+        POBJECT_ATTRIBUTES);
+    typedef LONG (NTAPI *AcNtQueryDirectoryObject)(
+        HANDLE,
+        PVOID,
+        ULONG,
+        BOOLEAN,
+        BOOLEAN,
+        PULONG,
+        PULONG);
+    HMODULE ntdll;
+    AcNtOpenDirectoryObject open_directory;
+    AcNtQueryDirectoryObject query_directory;
+    FARPROC open_procedure;
+    FARPROC query_procedure;
+    UNICODE_STRING directory_name;
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE directory = NULL;
+    ULONG context = 0;
+    bool restart_scan = true;
+    void *buffer = NULL;
+
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) {
+        return;
+    }
+    open_procedure = GetProcAddress(
+        ntdll,
+        "NtOpenDirectoryObject");
+    query_procedure = GetProcAddress(
+        ntdll,
+        "NtQueryDirectoryObject");
+    if (open_procedure == NULL || query_procedure == NULL ||
+        sizeof(open_directory) != sizeof(open_procedure) ||
+        sizeof(query_directory) != sizeof(query_procedure)) {
+        return;
+    }
+    memcpy(&open_directory, &open_procedure, sizeof(open_directory));
+    memcpy(&query_directory, &query_procedure, sizeof(query_directory));
+
+    directory_name.Buffer = L"\\Device";
+    directory_name.Length = (USHORT)(7u * sizeof(wchar_t));
+    directory_name.MaximumLength =
+        (USHORT)(8u * sizeof(wchar_t));
+    InitializeObjectAttributes(
+        &attributes,
+        &directory_name,
+        OBJ_CASE_INSENSITIVE,
+        NULL,
+        NULL);
+    if (open_directory(&directory, 0x0001u, &attributes) < 0) {
+        return;
+    }
+
+    buffer = malloc(AC_NATIVE_DEVICE_BUFFER_SIZE);
+    if (buffer == NULL) {
+        CloseHandle(directory);
+        return;
+    }
+
+    for (;;) {
+        AcObjectDirectoryInformation *entry;
+        ULONG returned = 0;
+        const LONG status = query_directory(
+            directory,
+            buffer,
+            AC_NATIVE_DEVICE_BUFFER_SIZE,
+            TRUE,
+            restart_scan ? TRUE : FALSE,
+            &context,
+            &returned);
+        wchar_t name[512];
+        size_t characters;
+        AcSeverity severity;
+        const char *indicator;
+
+        restart_scan = false;
+        if (status == AC_STATUS_NO_MORE_ENTRIES) {
+            stats->native_device_inventory_complete = true;
+            break;
+        }
+        if (status < 0) {
+            break;
+        }
+
+        entry = (AcObjectDirectoryInformation *)buffer;
+        if (!ac_unicode_string_equals(&entry->type_name, L"Device") ||
+            entry->name.Buffer == NULL || entry->name.Length == 0) {
+            continue;
+        }
+        characters = entry->name.Length / sizeof(wchar_t);
+        if (characters >= sizeof(name) / sizeof(name[0])) {
+            characters = sizeof(name) / sizeof(name[0]) - 1u;
+        }
+        wmemcpy(name, entry->name.Buffer, characters);
+        name[characters] = L'\0';
+        ++stats->native_device_names_visited;
+
+        indicator = ac_known_threat_device_indicator(name, &severity);
+        if (indicator == NULL) {
+            continue;
+        }
+        ++stats->indicators_observed;
+        (void)ac_emit_indicator(
+            sensor,
+            logger,
+            target_pid,
+            scan_id,
+            "native_device",
+            indicator,
+            name,
+            0,
+            severity,
+            stats);
+    }
+
+    free(buffer);
+    CloseHandle(directory);
 }
 
 static uint64_t ac_rect_area(const RECT *rect)
@@ -626,11 +1017,82 @@ static void ac_scan_overlay_candidates(
     }
 }
 
+static void ac_scan_target_wndproc(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t scan_id,
+    const AcRangeIndex *module_ranges,
+    AcThreatScanStats *stats)
+{
+    AcTargetWindowSearch target_search;
+    LONG_PTR window_proc;
+    AcDedupDecision decision;
+    uint64_t fingerprint;
+    char details[512];
+
+    if (module_ranges == NULL) {
+        return;
+    }
+    memset(&target_search, 0, sizeof(target_search));
+    target_search.target_pid = target_pid;
+    if (!EnumWindows(ac_find_target_window, (LPARAM)&target_search) ||
+        target_search.window == NULL) {
+        return;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    window_proc = GetWindowLongPtrW(target_search.window, GWLP_WNDPROC);
+    if (window_proc == 0 || ac_range_index_contains(
+            module_ranges,
+            (uintptr_t)window_proc,
+            1u)) {
+        return;
+    }
+
+    ++stats->indirect_dispatch_candidates;
+    fingerprint = ac_fnv1a64_text(
+        AC_FNV1A64_OFFSET,
+        "target_wndproc_outside_loader_modules");
+    fingerprint = ac_fnv1a64_continue(
+        fingerprint,
+        &window_proc,
+        sizeof(window_proc));
+    ac_dedup_observe(
+        &sensor->dedup,
+        fingerprint,
+        scan_id,
+        GetTickCount64(),
+        &decision);
+    if (!decision.emit) {
+        ++stats->events_suppressed;
+        return;
+    }
+
+    (void)snprintf(
+        details,
+        sizeof(details),
+        "{\"target_pid\":%lu,\"wndproc\":\"0x%" PRIxPTR
+        "\",\"reason\":\"dispatch_target_outside_loader_modules\","
+        "\"source_trust\":\"untrusted_user_mode\","
+        "\"verdict\":\"signal_only\"}",
+        (unsigned long)target_pid,
+        (uintptr_t)window_proc);
+    ac_log_event(
+        logger,
+        AC_SEVERITY_HIGH,
+        "target_wndproc_outside_loader_modules",
+        target_pid,
+        details);
+    ++stats->events_emitted;
+}
+
 void ac_threat_sensor_scan(
     AcThreatSensor *sensor,
     AcLogger *logger,
     DWORD target_pid,
     uint64_t scan_id,
+    const AcRangeIndex *module_ranges,
     AcThreatScanStats *stats_out)
 {
     AcThreatScanStats stats;
@@ -646,29 +1108,48 @@ void ac_threat_sensor_scan(
 
     ac_scan_process_indicators(sensor, logger, target_pid, scan_id, &stats);
     ac_scan_device_indicators(sensor, logger, target_pid, scan_id, &stats);
+    ac_scan_native_device_indicators(
+        sensor,
+        logger,
+        target_pid,
+        scan_id,
+        &stats);
     ac_scan_overlay_candidates(sensor, logger, target_pid, scan_id, &stats);
+    ac_scan_target_wndproc(
+        sensor,
+        logger,
+        target_pid,
+        scan_id,
+        module_ranges,
+        &stats);
 
     (void)snprintf(
         details,
         sizeof(details),
         "{\"scan_id\":%" PRIu64 ",\"processes_visited\":%zu," 
-        "\"device_names_visited\":%zu,\"windows_visited\":%zu," 
-        "\"indicators_observed\":%zu,\"overlay_candidates\":%zu," 
+        "\"device_names_visited\":%zu,"
+        "\"native_device_names_visited\":%zu,\"windows_visited\":%zu,"
+        "\"indicators_observed\":%zu,\"overlay_candidates\":%zu,"
+        "\"indirect_dispatch_candidates\":%zu,"
         "\"events_emitted\":%zu,\"events_suppressed\":%zu," 
         "\"process_inventory_complete\":%s," 
         "\"device_inventory_complete\":%s," 
+        "\"native_device_inventory_complete\":%s,"
         "\"window_inventory_complete\":%s," 
         "\"source_trust\":\"untrusted_user_mode\"}",
         scan_id,
         stats.processes_visited,
         stats.device_names_visited,
+        stats.native_device_names_visited,
         stats.windows_visited,
         stats.indicators_observed,
         stats.overlay_candidates,
+        stats.indirect_dispatch_candidates,
         stats.events_emitted,
         stats.events_suppressed,
         stats.process_inventory_complete ? "true" : "false",
         stats.device_inventory_complete ? "true" : "false",
+        stats.native_device_inventory_complete ? "true" : "false",
         stats.window_inventory_complete ? "true" : "false");
     ac_log_event(
         logger,

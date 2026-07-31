@@ -659,6 +659,40 @@ static void ac_integrity_report_identity(
         extra,
         stats);
     baseline->identity_reported = true;
+
+    if (context->policy.manifest != NULL &&
+        context->policy.manifest->trusted &&
+        !baseline->manifest_reported) {
+        const AcManifestMatch match = ac_manifest_match(
+            context->policy.manifest,
+            AC_MANIFEST_MODULE,
+            baseline->path,
+            baseline->file_sha256);
+
+        if (match != AC_MANIFEST_AUTHORIZED) {
+            (void)snprintf(
+                extra,
+                sizeof(extra),
+                "\"file_sha256\":\"%s\","
+                "\"manifest_sha256\":\"%s\","
+                "\"reason\":\"%s\",",
+                digest,
+                context->policy.manifest->file_sha256,
+                match == AC_MANIFEST_HASH_MISMATCH
+                    ? "manifest_hash_mismatch"
+                    : "module_not_in_manifest");
+            ac_integrity_report_module_event(
+                context,
+                target->pid,
+                AC_SEVERITY_HIGH,
+                "module_manifest_violation",
+                baseline,
+                scan_id,
+                extra,
+                stats);
+        }
+        baseline->manifest_reported = true;
+    }
 }
 
 static bool ac_integrity_baseline_is_loaded(
@@ -722,6 +756,7 @@ static void ac_integrity_reset_baseline(
     baseline->unavailable_reason = NULL;
     baseline->unavailable_since_scan_id = 0;
     baseline->identity_reported = false;
+    baseline->manifest_reported = false;
 }
 
 static bool ac_integrity_file_identity_matches(

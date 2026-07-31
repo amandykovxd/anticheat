@@ -5,7 +5,8 @@ It combines an optional WDM driver, a user-mode memory and module collector, a
 versioned IOCTL ABI, and tamper-evident JSONL output.
 
 The implementation produces telemetry only. Enforcement, account actions,
-remote transport, and game-specific policy remain integrator-owned.
+production transport credentials, and game-specific policy remain
+integrator-owned.
 
 ## Entry points
 
@@ -24,13 +25,16 @@ Implemented components:
 
 - x64 `AcTelemetry.sys` WDM telemetry driver;
 - x64 and Win32 `anticheat.exe` collector;
+- reduced-scope macOS and Linux collectors;
 - fixed-size versioned buffered IOCTL protocol;
-- process and image-load callback telemetry;
+- process, image-load, thread, and process-handle callback telemetry;
 - module and executable-memory classification;
+- pinned module/driver manifest and configured dispatch validation;
 - event de-duplication and bounded scan budgets;
 - JSONL rotation and SHA-256 integrity chain;
-- x64, Win32, sanitizer, and CodeQL validation workflows.
+- authenticated transport sidecar and reference receiver;
+- WDK x64, collector, sanitizer, and CodeQL validation workflows.
 
-Production deployment still requires WDK CI, Driver Verifier, HLK validation,
-package signing, installer lifecycle tests, and a server-side correlation
+Production deployment still requires Driver Verifier, HLK validation, package
+signing, installer lifecycle tests, and an integrator-owned correlation
 service.

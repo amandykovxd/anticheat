@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(anticheat_telemetry VERSION 0.3.0 LANGUAGES C)
+project(anticheat_telemetry VERSION 0.4.0 LANGUAGES C)
 
 function(ac_enable_warnings target)
     if(MSVC)
@@ -150,6 +150,45 @@ if(APPLE)
     return()
 endif()
 
+if(UNIX AND NOT APPLE)
+    add_executable(anticheat src/linux_main.c)
+    target_link_libraries(anticheat PRIVATE anticheat_portable)
+    target_compile_features(anticheat PRIVATE c_std_11)
+    ac_enable_warnings(anticheat)
+
+    if(BUILD_TESTING)
+        add_test(NAME linux.cli.version COMMAND anticheat --version)
+        add_test(NAME linux.cli.help COMMAND anticheat --help)
+        add_test(
+            NAME linux.live_self_scan
+            COMMAND anticheat --self --once --quiet
+                --log ${CMAKE_CURRENT_BINARY_DIR}/linux-self-scan.jsonl
+        )
+        if(Python3_Interpreter_FOUND)
+            add_test(
+                NAME linux.suspicious_executable_mapping
+                COMMAND
+                    ${Python3_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_linux_suspicious_fixture.py"
+                    --collector $<TARGET_FILE:anticheat>
+                    --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tools/linux_suspicious_fixture.py"
+            )
+            set_tests_properties(
+                linux.suspicious_executable_mapping
+                PROPERTIES LABELS "linux;integration" TIMEOUT 30
+            )
+        endif()
+        set_tests_properties(
+            linux.cli.version linux.cli.help linux.live_self_scan
+            PROPERTIES LABELS "linux" TIMEOUT 30
+        )
+    endif()
+
+    install(TARGETS anticheat RUNTIME DESTINATION bin)
+    install(PROGRAMS tools/linux_suspicious_fixture.py DESTINATION tools)
+    return()
+endif()
+
 if(NOT WIN32)
     message(STATUS
         "Non-Windows host: building the portable core and its tests only. "
@@ -161,12 +200,13 @@ add_library(anticheat_core STATIC
     src/integrity.c
     src/kernel_client.c
     src/log.c
+    src/manifest.c
     src/process.c
     src/scanner.c
     src/threat_sensor.c
 )
 target_include_directories(anticheat_core PUBLIC src include)
-target_link_libraries(anticheat_core PUBLIC anticheat_portable bcrypt advapi32 user32)
+target_link_libraries(anticheat_core PUBLIC anticheat_portable bcrypt advapi32 psapi user32)
 target_compile_definitions(anticheat_core PUBLIC
     UNICODE
     _UNICODE
@@ -209,6 +249,14 @@ if(BUILD_TESTING)
         kernel_sequence_gap
         kernel_drop_counter
         kernel_user_correlation
+        kernel_thread_correlation
+        dispatch_watch_pointer
+        dispatch_watch_vtable
+        dispatch_watch_invalid
+        manifest_pinned_load
+        manifest_wrong_pin
+        manifest_duplicate
+        manifest_integrity_violation
         threat_process_indicators
         threat_device_indicators
         threat_posture_classification

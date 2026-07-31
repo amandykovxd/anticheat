@@ -175,6 +175,11 @@ static void test_threat_device_indicators(void)
     AC_CHECK(strcmp(indicator, "intel_vulnerable_driver_device") == 0);
     AC_CHECK(severity == AC_SEVERITY_MEDIUM);
 
+    indicator = ac_known_threat_device_indicator(L"valthrun", &severity);
+    AC_CHECK(indicator != NULL);
+    AC_CHECK(strcmp(indicator, "valthrun_native_kernel_device") == 0);
+    AC_CHECK(severity == AC_SEVERITY_HIGH);
+
     AC_CHECK(ac_known_threat_device_indicator(L"AcTelemetry", &severity) == NULL);
     AC_CHECK(severity == AC_SEVERITY_INFO);
     AC_CHECK(ac_known_threat_device_indicator(NULL, &severity) == NULL);
@@ -847,6 +852,10 @@ static void test_driver_protocol_session_layout(void)
     AcDriverTargetRequest request;
     AcDriverStats stats;
     volatile uint32_t protocol_version;
+    volatile uint32_t process_handle_event;
+    volatile uint32_t thread_created_event;
+    volatile uint32_t thread_exited_event;
+    volatile uint32_t required_callbacks;
     volatile size_t request_size;
     volatile size_t stats_size;
 
@@ -857,10 +866,18 @@ static void test_driver_protocol_session_layout(void)
     request.target_pid = 42u;
     request.session_id = UINT64_C(0x0102030405060708);
     protocol_version = AC_DRIVER_PROTOCOL_VERSION;
+    process_handle_event = AC_DRIVER_EVENT_PROCESS_HANDLE;
+    thread_created_event = AC_DRIVER_EVENT_THREAD_CREATED;
+    thread_exited_event = AC_DRIVER_EVENT_THREAD_EXITED;
+    required_callbacks = AC_DRIVER_CALLBACK_REQUIRED;
     request_size = sizeof(request);
     stats_size = sizeof(stats);
 
-    AC_CHECK(protocol_version == 3u);
+    AC_CHECK(protocol_version == 4u);
+    AC_CHECK(process_handle_event == 5u);
+    AC_CHECK(thread_created_event == 6u);
+    AC_CHECK(thread_exited_event == 7u);
+    AC_CHECK(required_callbacks == 0x0fu);
     AC_CHECK(request_size == 24u);
     AC_CHECK(stats_size == 56u);
     AC_CHECK(request.session_id != 0);
@@ -906,7 +923,7 @@ static void test_kernel_drop_counter_is_monotonic(void)
     stats.events_dropped = 7u;
     stats.queue_depth = AC_DRIVER_QUEUE_CAPACITY;
     stats.queue_capacity = AC_DRIVER_QUEUE_CAPACITY;
-    stats.callbacks_active = 3u;
+    stats.callbacks_active = AC_DRIVER_CALLBACK_REQUIRED;
     if (!ac_logger_open(&logger, path, false, 0, 0)) {
         AC_CHECK(false);
         return;
@@ -997,6 +1014,284 @@ static void test_kernel_user_module_correlation(void)
     (void)_wremove(path);
 }
 
+static void test_dispatch_watch_pointer_parse(void)
+{
+    AcDispatchWatch watch;
+
+    AC_CHECK(ac_dispatch_watch_parse(
+        L"SDL3.dll+0x1234",
+        AC_DISPATCH_FUNCTION_POINTER,
+        &watch));
+    AC_CHECK(_wcsicmp(watch.module_name, L"SDL3.dll") == 0);
+    AC_CHECK(watch.slot_rva == 0x1234u);
+    AC_CHECK(watch.entry_count == 1u);
+    AC_CHECK(watch.kind == AC_DISPATCH_FUNCTION_POINTER);
+}
+
+static void test_dispatch_watch_vtable_parse(void)
+{
+    AcDispatchWatch watch;
+
+    AC_CHECK(ac_dispatch_watch_parse(
+        L"client.dll+4096:12",
+        AC_DISPATCH_OBJECT_VTABLE,
+        &watch));
+    AC_CHECK(_wcsicmp(watch.module_name, L"client.dll") == 0);
+    AC_CHECK(watch.slot_rva == 4096u);
+    AC_CHECK(watch.entry_count == 12u);
+    AC_CHECK(watch.kind == AC_DISPATCH_OBJECT_VTABLE);
+}
+
+static void test_dispatch_watch_rejects_invalid_specs(void)
+{
+    AcDispatchWatch watch;
+
+    AC_CHECK(!ac_dispatch_watch_parse(
+        L"client.dll",
+        AC_DISPATCH_FUNCTION_POINTER,
+        &watch));
+    AC_CHECK(!ac_dispatch_watch_parse(
+        L"C:\\game\\client.dll+0x10",
+        AC_DISPATCH_FUNCTION_POINTER,
+        &watch));
+    AC_CHECK(!ac_dispatch_watch_parse(
+        L"client.dll+0x10:0",
+        AC_DISPATCH_OBJECT_VTABLE,
+        &watch));
+    AC_CHECK(!ac_dispatch_watch_parse(
+        L"client.dll+0x10:65",
+        AC_DISPATCH_OBJECT_VTABLE,
+        &watch));
+    AC_CHECK(!ac_dispatch_watch_parse(
+        L"client.dll+0x100000000",
+        AC_DISPATCH_FUNCTION_POINTER,
+        &watch));
+}
+
+static bool ac_test_write_text_file(
+    const wchar_t *path,
+    const char *content)
+{
+    FILE *file = _wfopen(path, L"wb");
+    const size_t length = strlen(content);
+
+    if (file == NULL) {
+        return false;
+    }
+    if (fwrite(content, 1u, length, file) != length) {
+        (void)fclose(file);
+        return false;
+    }
+    return fclose(file) == 0;
+}
+
+static void ac_test_ascii_pin_to_wide(
+    const char pin[AC_SHA256_HEX_SIZE],
+    wchar_t wide[AC_SHA256_HEX_SIZE])
+{
+    size_t index;
+
+    for (index = 0; index < AC_SHA256_HEX_SIZE; ++index) {
+        wide[index] = (wchar_t)(unsigned char)pin[index];
+    }
+}
+
+static bool ac_test_create_manifest(
+    wchar_t path[MAX_PATH],
+    wchar_t pin[AC_SHA256_HEX_SIZE])
+{
+    static const char content[] =
+        "ac-manifest-v1\n"
+        "module 0000000000000000000000000000000000000000000000000000000000000000 test.dll\n"
+        "driver ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff test.sys\n";
+    char digest[AC_SHA256_HEX_SIZE];
+    uint64_t size = 0;
+
+    if (!ac_temp_log_path(path, MAX_PATH, L"ac-manifest") ||
+        !ac_test_write_text_file(path, content) ||
+        !ac_hash_file(path, digest, &size) || size == 0) {
+        return false;
+    }
+    ac_test_ascii_pin_to_wide(digest, pin);
+    return true;
+}
+
+static void test_manifest_pinned_load_and_match(void)
+{
+    AcManifest manifest;
+    wchar_t path[MAX_PATH];
+    wchar_t pin[AC_SHA256_HEX_SIZE];
+    uint8_t zero_digest[AC_SHA256_DIGEST_SIZE];
+    uint8_t other_digest[AC_SHA256_DIGEST_SIZE];
+
+    ac_manifest_init(&manifest);
+    memset(zero_digest, 0, sizeof(zero_digest));
+    memset(other_digest, 1, sizeof(other_digest));
+    AC_CHECK(ac_test_create_manifest(path, pin));
+    AC_CHECK(ac_manifest_load_pinned(&manifest, path, pin));
+    AC_CHECK(manifest.trusted);
+    AC_CHECK(manifest.count == 2u);
+    AC_CHECK(ac_manifest_match(
+        &manifest,
+        AC_MANIFEST_MODULE,
+        L"C:\\game\\test.dll",
+        zero_digest) == AC_MANIFEST_AUTHORIZED);
+    AC_CHECK(ac_manifest_match(
+        &manifest,
+        AC_MANIFEST_MODULE,
+        L"C:\\game\\test.dll",
+        other_digest) == AC_MANIFEST_HASH_MISMATCH);
+    AC_CHECK(ac_manifest_match(
+        &manifest,
+        AC_MANIFEST_MODULE,
+        L"C:\\game\\missing.dll",
+        zero_digest) == AC_MANIFEST_NOT_LISTED);
+    ac_manifest_free(&manifest);
+    (void)_wremove(path);
+}
+
+static void test_manifest_rejects_wrong_pin(void)
+{
+    AcManifest manifest;
+    wchar_t path[MAX_PATH];
+    wchar_t pin[AC_SHA256_HEX_SIZE];
+
+    ac_manifest_init(&manifest);
+    AC_CHECK(ac_test_create_manifest(path, pin));
+    pin[0] = pin[0] == L'0' ? L'1' : L'0';
+    AC_CHECK(!ac_manifest_load_pinned(&manifest, path, pin));
+    AC_CHECK(!manifest.trusted);
+    AC_CHECK(manifest.count == 0u);
+    ac_manifest_free(&manifest);
+    (void)_wremove(path);
+}
+
+static void test_manifest_rejects_duplicate_entry(void)
+{
+    static const char content[] =
+        "ac-manifest-v1\n"
+        "module 0000000000000000000000000000000000000000000000000000000000000000 test.dll\n"
+        "module ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff TEST.DLL\n";
+    AcManifest manifest;
+    wchar_t path[MAX_PATH];
+    wchar_t pin[AC_SHA256_HEX_SIZE];
+    char digest[AC_SHA256_HEX_SIZE];
+    uint64_t size = 0;
+
+    ac_manifest_init(&manifest);
+    AC_CHECK(ac_temp_log_path(path, MAX_PATH, L"ac-manifest-duplicate"));
+    AC_CHECK(ac_test_write_text_file(path, content));
+    AC_CHECK(ac_hash_file(path, digest, &size));
+    ac_test_ascii_pin_to_wide(digest, pin);
+    AC_CHECK(!ac_manifest_load_pinned(&manifest, path, pin));
+    AC_CHECK(!manifest.trusted);
+    ac_manifest_free(&manifest);
+    (void)_wremove(path);
+}
+
+static void test_integrity_reports_manifest_violation(void)
+{
+    AcIntegrityFixture fixture;
+    AcManifest manifest;
+    AcScanStats stats;
+    wchar_t manifest_path[MAX_PATH];
+    wchar_t pin[AC_SHA256_HEX_SIZE];
+    const wchar_t *base_name;
+    char base_name_utf8[MAX_PATH * 3];
+    char content[MAX_PATH * 3 + 160];
+    char digest[AC_SHA256_HEX_SIZE];
+    uint64_t size = 0;
+
+    ac_manifest_init(&manifest);
+    if (!ac_test_integrity_setup(&fixture, L"ac-manifest-integrity")) {
+        AC_CHECK(false);
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+    base_name = wcsrchr(fixture.target.image_path, L'\\');
+    base_name = base_name != NULL ? base_name + 1u : fixture.target.image_path;
+    AC_CHECK(ac_wide_to_utf8(
+        base_name,
+        base_name_utf8,
+        sizeof(base_name_utf8)));
+    (void)snprintf(
+        content,
+        sizeof(content),
+        "ac-manifest-v1\n"
+        "module 0000000000000000000000000000000000000000000000000000000000000000 %s\n",
+        base_name_utf8);
+    AC_CHECK(ac_temp_log_path(
+        manifest_path,
+        MAX_PATH,
+        L"ac-manifest-integrity-policy"));
+    AC_CHECK(ac_test_write_text_file(manifest_path, content));
+    AC_CHECK(ac_hash_file(manifest_path, digest, &size));
+    ac_test_ascii_pin_to_wide(digest, pin);
+    AC_CHECK(ac_manifest_load_pinned(&manifest, manifest_path, pin));
+    fixture.context.policy.manifest = &manifest;
+
+    memset(&stats, 0, sizeof(stats));
+    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(ac_test_log_contains(
+        fixture.log_path,
+        "\"event\":\"module_manifest_violation\""));
+    AC_CHECK(ac_test_log_contains(
+        fixture.log_path,
+        "\"reason\":\"manifest_hash_mismatch\""));
+
+    ac_manifest_free(&manifest);
+    (void)_wremove(manifest_path);
+    ac_test_integrity_teardown(&fixture);
+}
+
+static void test_kernel_thread_start_correlation(void)
+{
+    AcKernelClient client;
+    AcLogger logger;
+    AcRangeIndex ranges;
+    wchar_t path[MAX_PATH];
+    uint64_t mismatches = 0;
+
+    AC_CHECK(ac_temp_log_path(path, MAX_PATH, L"ac-thread-correlation"));
+    (void)_wremove(path);
+    ac_kernel_client_init(&client);
+    client.thread_observations[0].sequence = 1u;
+    client.thread_observations[0].thread_id = 10u;
+    client.thread_observations[0].creator_pid = 20u;
+    client.thread_observations[0].start_address = 0x1010u;
+    client.thread_observations[1].sequence = 2u;
+    client.thread_observations[1].thread_id = 11u;
+    client.thread_observations[1].creator_pid = 21u;
+    client.thread_observations[1].start_address = 0x9000u;
+    client.thread_observation_count = 2u;
+    ac_range_index_init(&ranges);
+    AC_CHECK(ac_range_index_add(&ranges, 0x1000u, 0x1000u));
+    ac_range_index_finalize(&ranges);
+    AC_CHECK(ac_logger_open(&logger, path, false, 0, 0));
+
+    ac_kernel_client_correlate_scan(
+        &client,
+        &logger,
+        GetCurrentProcessId(),
+        7u,
+        &ranges,
+        &mismatches);
+
+    AC_CHECK(mismatches == 0u);
+    AC_CHECK(client.thread_observation_count == 0u);
+    AC_CHECK(!client.telemetry_complete);
+    ac_logger_close(&logger);
+    AC_CHECK(ac_test_log_contains(
+        path,
+        "\"event\":\"kernel_thread_start_unlinked\""));
+    AC_CHECK(ac_test_log_contains_both(
+        path,
+        "\"event\":\"kernel_thread_scan_correlation\"",
+        "\"starts_suspicious_or_unavailable\":1"));
+    ac_range_index_free(&ranges);
+    (void)_wremove(path);
+}
+
 typedef void (*AcCoreTestFunction)(void);
 
 typedef struct AcCoreTestCase {
@@ -1024,6 +1319,14 @@ static const AcCoreTestCase g_test_cases[] = {
     {"kernel_sequence_gap", test_kernel_sequence_gap_is_detected},
     {"kernel_drop_counter", test_kernel_drop_counter_is_monotonic},
     {"kernel_user_correlation", test_kernel_user_module_correlation},
+    {"kernel_thread_correlation", test_kernel_thread_start_correlation},
+    {"dispatch_watch_pointer", test_dispatch_watch_pointer_parse},
+    {"dispatch_watch_vtable", test_dispatch_watch_vtable_parse},
+    {"dispatch_watch_invalid", test_dispatch_watch_rejects_invalid_specs},
+    {"manifest_pinned_load", test_manifest_pinned_load_and_match},
+    {"manifest_wrong_pin", test_manifest_rejects_wrong_pin},
+    {"manifest_duplicate", test_manifest_rejects_duplicate_entry},
+    {"manifest_integrity_violation", test_integrity_reports_manifest_violation},
     {"threat_process_indicators", test_threat_process_indicators},
     {"threat_device_indicators", test_threat_device_indicators},
     {"threat_posture_classification", test_threat_posture_classification},

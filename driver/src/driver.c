@@ -25,6 +25,8 @@ typedef struct AcDeviceExtension {
     ULONGLONG events_dropped;
     BOOLEAN process_callback_registered;
     BOOLEAN image_callback_registered;
+    BOOLEAN thread_callback_registered;
+    PVOID handle_callback_registration;
 } AcDeviceExtension;
 
 static AcDeviceExtension *g_extension;
@@ -70,6 +72,17 @@ static NTSTATUS AcCompleteIrp(PIRP irp, NTSTATUS status, ULONG_PTR information)
 static ULONG AcHandleToPid(HANDLE process_id)
 {
     return (ULONG)(ULONG_PTR)process_id;
+}
+
+static ACCESS_MASK AcDangerousProcessAccessMask(VOID)
+{
+    return PROCESS_TERMINATE |
+           PROCESS_CREATE_THREAD |
+           PROCESS_VM_OPERATION |
+           PROCESS_VM_READ |
+           PROCESS_VM_WRITE |
+           PROCESS_DUP_HANDLE |
+           PROCESS_SUSPEND_RESUME;
 }
 
 static VOID AcCopyUnicodePath(
@@ -244,6 +257,116 @@ static VOID AcImageNotify(
     AcEnqueueEvent(&event, target_pid);
 }
 
+static VOID AcThreadNotify(
+    HANDLE process_id,
+    HANDLE thread_id,
+    BOOLEAN create)
+{
+    AcDriverEvent event;
+    const ULONG pid = AcHandleToPid(process_id);
+    const ULONG target_pid = AcGetTargetPid();
+
+    if (target_pid == 0 || pid != target_pid) {
+        return;
+    }
+
+    RtlZeroMemory(&event, sizeof(event));
+    event.type = create
+        ? AC_DRIVER_EVENT_THREAD_CREATED
+        : AC_DRIVER_EVENT_THREAD_EXITED;
+    event.process_id = pid;
+    event.parent_process_id = AcHandleToPid(thread_id);
+    event.reserved = AcHandleToPid(PsGetCurrentProcessId());
+    event.status = create ? 1 : 0;
+    AcEnqueueEvent(&event, target_pid);
+}
+
+static OB_PREOP_CALLBACK_STATUS AcProcessHandlePreOperation(
+    PVOID registration_context,
+    POB_PRE_OPERATION_INFORMATION operation_information)
+{
+    AcDriverEvent event;
+    ACCESS_MASK original_access;
+    ACCESS_MASK desired_access;
+    const ULONG target_pid = AcGetTargetPid();
+    ULONG object_pid;
+    ULONG requestor_pid;
+
+    UNREFERENCED_PARAMETER(registration_context);
+
+    if (target_pid == 0 || operation_information == NULL ||
+        operation_information->ObjectType != *PsProcessType) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    object_pid = AcHandleToPid(PsGetProcessId(
+        (PEPROCESS)operation_information->Object));
+    requestor_pid = AcHandleToPid(PsGetCurrentProcessId());
+    if (object_pid != target_pid || requestor_pid == target_pid) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (operation_information->Operation == OB_OPERATION_HANDLE_CREATE) {
+        original_access = operation_information->Parameters
+            ->CreateHandleInformation.OriginalDesiredAccess;
+        desired_access = operation_information->Parameters
+            ->CreateHandleInformation.DesiredAccess;
+    } else if (operation_information->Operation ==
+               OB_OPERATION_HANDLE_DUPLICATE) {
+        original_access = operation_information->Parameters
+            ->DuplicateHandleInformation.OriginalDesiredAccess;
+        desired_access = operation_information->Parameters
+            ->DuplicateHandleInformation.DesiredAccess;
+    } else {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if ((original_access & AcDangerousProcessAccessMask()) == 0) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    RtlZeroMemory(&event, sizeof(event));
+    event.type = AC_DRIVER_EVENT_PROCESS_HANDLE;
+    event.process_id = requestor_pid;
+    event.parent_process_id = target_pid;
+    event.status = (int32_t)operation_information->Operation;
+    event.image_base = (uint64_t)original_access;
+    event.image_size = (uint64_t)desired_access;
+    event.flags |= AC_DRIVER_EVENT_FLAG_PATH_UNAVAILABLE;
+    if (operation_information->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
+        event.flags |= AC_DRIVER_EVENT_FLAG_HANDLE_DUPLICATE;
+    }
+    if (operation_information->KernelHandle) {
+        event.flags |= AC_DRIVER_EVENT_FLAG_KERNEL_HANDLE;
+    }
+    AcEnqueueEvent(&event, target_pid);
+    return OB_PREOP_SUCCESS;
+}
+
+static NTSTATUS AcRegisterHandleCallback(VOID)
+{
+    OB_OPERATION_REGISTRATION operation;
+    OB_CALLBACK_REGISTRATION registration;
+    UNICODE_STRING altitude = RTL_CONSTANT_STRING(L"385200");
+
+    RtlZeroMemory(&operation, sizeof(operation));
+    operation.ObjectType = PsProcessType;
+    operation.Operations =
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operation.PreOperation = AcProcessHandlePreOperation;
+
+    RtlZeroMemory(&registration, sizeof(registration));
+    registration.Version = OB_FLT_REGISTRATION_VERSION;
+    registration.OperationRegistrationCount = 1;
+    registration.Altitude = altitude;
+    registration.RegistrationContext = g_extension;
+    registration.OperationRegistration = &operation;
+
+    return ObRegisterCallbacks(
+        &registration,
+        &g_extension->handle_callback_registration);
+}
+
 static NTSTATUS AcSetTarget(
     const AcDriverTargetRequest *request)
 {
@@ -341,8 +464,14 @@ static VOID AcGetStats(AcDriverStats *stats)
     stats->target_pid = g_extension->target_pid;
     stats->queue_depth = g_extension->count;
     stats->callbacks_active =
-        (g_extension->process_callback_registered ? 1u : 0u) |
-        (g_extension->image_callback_registered ? 2u : 0u);
+        (g_extension->process_callback_registered
+            ? AC_DRIVER_CALLBACK_PROCESS : 0u) |
+        (g_extension->image_callback_registered
+            ? AC_DRIVER_CALLBACK_IMAGE : 0u) |
+        (g_extension->thread_callback_registered
+            ? AC_DRIVER_CALLBACK_THREAD : 0u) |
+        (g_extension->handle_callback_registration != NULL
+            ? AC_DRIVER_CALLBACK_HANDLE : 0u);
     stats->session_id = g_extension->session_id;
     KeReleaseSpinLock(&g_extension->lock, old_irql);
 }
@@ -461,6 +590,17 @@ VOID AcDriverUnload(PDRIVER_OBJECT driver_object)
         RTL_CONSTANT_STRING(AC_DRIVER_DOS_DEVICE_NAME);
 
     if (g_extension != NULL &&
+        g_extension->handle_callback_registration != NULL) {
+        ObUnRegisterCallbacks(
+            g_extension->handle_callback_registration);
+        g_extension->handle_callback_registration = NULL;
+    }
+    if (g_extension != NULL &&
+        g_extension->thread_callback_registered) {
+        (void)PsRemoveCreateThreadNotifyRoutine(AcThreadNotify);
+        g_extension->thread_callback_registered = FALSE;
+    }
+    if (g_extension != NULL &&
         g_extension->image_callback_registered) {
         (void)PsRemoveLoadImageNotifyRoutine(AcImageNotify);
         g_extension->image_callback_registered = FALSE;
@@ -561,6 +701,16 @@ NTSTATUS DriverEntry(
         return status;
     }
     g_extension->image_callback_registered = TRUE;
+
+    status = PsSetCreateThreadNotifyRoutine(AcThreadNotify);
+    if (NT_SUCCESS(status)) {
+        g_extension->thread_callback_registered = TRUE;
+    }
+
+    status = AcRegisterHandleCallback();
+    if (!NT_SUCCESS(status)) {
+        g_extension->handle_callback_registration = NULL;
+    }
 
     device_object->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;

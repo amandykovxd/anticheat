@@ -20,7 +20,7 @@ server-side correlation are outside the repository.
 ```text
 Kernel boundary
   AcTelemetry.sys
-  process/image callbacks
+  process/image/thread/handle callbacks
   bounded event queue
   SYSTEM-only device ACL
            |
@@ -52,7 +52,9 @@ The current driver:
 
 - registers `PsSetCreateProcessNotifyRoutineEx`;
 - registers `PsSetLoadImageNotifyRoutine`;
-- unregisters both callbacks before unload;
+- registers `PsSetCreateThreadNotifyRoutine`;
+- registers `ObRegisterCallbacks` for telemetry-only process-handle access;
+- unregisters all callbacks before unload;
 - records image events only for one registered PID and process creation for
   that PID's direct children;
 - uses a fixed-capacity nonpaged queue;
@@ -64,7 +66,8 @@ The current driver:
   `D:P(A;;GA;;;SY)`;
 - creates an exclusive device handle;
 - reports queue overwrites through `events_dropped`;
-- does not return kernel pointers.
+- does not return kernel pointers;
+- records requested process access but does not modify `DesiredAccess`;
 
 The driver does not:
 
@@ -74,6 +77,7 @@ The driver does not:
 - create remote threads;
 - hide processes, drivers, handles, files, or registry entries;
 - block process creation or image loading;
+- block, remove, or downgrade process handles;
 - modify `PS_CREATE_NOTIFY_INFO.CreationStatus`;
 - terminate or suspend processes;
 - implement an IOCTL for arbitrary address access;

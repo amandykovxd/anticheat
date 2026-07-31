@@ -252,6 +252,9 @@ The following event identifiers use the same detail contract:
 - `kernel_process_exited`;
 - `kernel_image_loaded`;
 - `kernel_system_image_loaded`;
+- `kernel_process_handle_requested`;
+- `kernel_thread_created`;
+- `kernel_thread_exited`;
 - `kernel_event_unknown`.
 
 Fields:
@@ -278,6 +281,9 @@ Driver event types:
 | `2` | `AC_DRIVER_EVENT_PROCESS_CREATED` |
 | `3` | `AC_DRIVER_EVENT_PROCESS_EXITED` |
 | `4` | `AC_DRIVER_EVENT_IMAGE_LOADED` |
+| `5` | `AC_DRIVER_EVENT_PROCESS_HANDLE` |
+| `6` | `AC_DRIVER_EVENT_THREAD_CREATED` |
+| `7` | `AC_DRIVER_EVENT_THREAD_EXITED` |
 
 `kernel_process_created` may describe a direct child of the registered target.
 In that case the envelope `pid` is the child PID and `details.parent_pid` is
@@ -295,6 +301,38 @@ Driver event flags:
 | `0x00000001` | `AC_DRIVER_EVENT_FLAG_PATH_TRUNCATED` |
 | `0x00000002` | `AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE` |
 | `0x00000004` | `AC_DRIVER_EVENT_FLAG_PATH_UNAVAILABLE` |
+| `0x00000008` | `AC_DRIVER_EVENT_FLAG_HANDLE_DUPLICATE` |
+| `0x00000010` | `AC_DRIVER_EVENT_FLAG_KERNEL_HANDLE` |
+
+### `kernel_process_handle_requested`
+
+Severity: `medium` for read access and `high` when the request contains
+termination, remote-thread, VM write/operation, duplicate-handle, or
+suspend/resume rights.
+
+Fields:
+
+- `driver_sequence` and `kernel_timestamp_100ns`;
+- `requestor_pid` and `target_pid`;
+- `operation`: `create` or `duplicate`;
+- `original_access` and `observed_access`;
+- `kernel_handle`;
+- `requestor_path`;
+- `source`: `ob_callback`;
+- `verdict`: `telemetry_only`.
+
+The callback does not remove access rights or reject the operation.
+
+### Thread lifecycle and correlation
+
+`kernel_thread_created` and `kernel_thread_exited` contain `thread_id`,
+`creator_pid`, and the best-effort `start_address`. The collector retains
+creation observations until the next module snapshot.
+
+`kernel_thread_start_unlinked` is `high` when a nonzero start address is
+outside every loader-visible module. `kernel_thread_start_unavailable` is
+`low` and describes a thread that exited or could not be queried.
+`kernel_thread_scan_correlation` summarizes both classes.
 
 ## System threat sensor events
 
@@ -324,7 +362,7 @@ Severity: `medium` or `high`.
 Fields:
 
 - `indicator_set`: versioned source-revision identifier;
-- `category`: `process_image` or `dos_device`;
+- `category`: `process_image`, `dos_device`, or `native_device`;
 - `indicator`;
 - `observed_name`;
 - `observed_pid`;
@@ -360,8 +398,9 @@ software can match; the event is never sufficient for an automatic sanction.
 Severity: `info`.
 
 The record contains inventory counts, observed and suppressed signal counts,
-and independent completion flags for process, DOS-device, and window
-inventories. Any false completion flag is a coverage gap for that scan.
+indirect-dispatch candidates, and independent completion flags for process,
+DOS-device, native Object Manager device, and window inventories. Any false
+completion flag is a coverage gap for that scan.
 
 ### `kernel_event_queue_overflow`
 
@@ -409,9 +448,10 @@ malformed protocol data.
 
 Severity: `high`.
 
-The driver statistics callback mask differs from `3`, which means the process
-or image-load callback is inactive. A transition back to the expected mask is
-reported as `kernel_callback_health_restored`.
+The driver statistics callback mask differs from `15`, which means at least one
+of the process, image-load, thread, or process-handle callbacks is inactive. A
+transition back to the expected mask is reported as
+`kernel_callback_health_restored`.
 
 ### `kernel_user_module_mismatch`
 
@@ -631,8 +671,53 @@ allowed roots. Fields:
 - `volume_serial`, `file_index`;
 - `reason`: `module_identity_observed`.
 
-The server must compare this identity with the signed application manifest.
-Directory membership alone is not a trust decision.
+The server must compare this identity with the control-plane-pinned application
+manifest. Directory membership alone is not a trust decision.
+
+### Trusted manifest events
+
+`trusted_manifest_loaded` records the control-plane-pinned manifest SHA-256
+and entry count. `trusted_manifest_rejected` is `high` when parsing or pin
+verification fails. `trusted_manifest_unavailable` is `medium` because module
+and driver identity remains telemetry rather than authorization.
+
+`module_manifest_violation` and `kernel_driver_manifest_violation` are `high`
+when an observed file is absent from the pinned manifest or its SHA-256 does
+not match. A driver whose file cannot be hashed is `medium`. These remain
+signals because the endpoint can tamper with user-mode observations.
+
+`loaded_kernel_driver_observed` contains image base, normalized path, optional
+SHA-256, file size, and source `psapi_startup_snapshot`.
+`loaded_kernel_driver_snapshot_completed` reports inventory completeness and
+is incomplete when PSAPI does not expose a path for every returned driver.
+
+### Indirect dispatch validation
+
+The following configured-watch events are `high`:
+
+- `dispatch_pointer_outside_loader_modules`;
+- `vtable_storage_outside_loader_modules`;
+- `vtable_entry_outside_loader_modules`;
+- `target_wndproc_outside_loader_modules`.
+
+Fields include module name, configured slot RVA, resolved slot/table address,
+entry index, destination, and reason. `dispatch_watch_unavailable` is `low`.
+`dispatch_watch_coverage_gap` reports findings omitted by the per-scan event
+budget.
+
+### Linux-specific events
+
+The Linux procfs collector emits:
+
+- `linux_suspicious_executable_mapping`;
+- `linux_target_traced`;
+- `linux_foreign_target_mem_open`;
+- `linux_uinput_owner_observed`;
+- `linux_kernel_audit_unavailable`.
+
+`linux_kernel_audit_unavailable` is a capability gap: procfs cannot identify
+callers of `process_vm_readv` or `process_vm_writev`. An eBPF LSM or audit
+integration is required for those operations.
 
 ### `module_file_identity_changed`
 

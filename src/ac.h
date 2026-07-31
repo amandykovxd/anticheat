@@ -9,13 +9,14 @@
 
 #include "ac_driver_protocol.h"
 #include "dedup.h"
+#include "manifest.h"
 #include "pe.h"
 #include "ranges.h"
 #include "sha256.h"
 #include "text.h"
 
 #define AC_AGENT_NAME "anticheat-collector"
-#define AC_AGENT_VERSION "0.3.0"
+#define AC_AGENT_VERSION "0.4.0"
 #define AC_SCHEMA_VERSION 5u
 
 #define AC_MAX_MODULES 8192u
@@ -30,8 +31,11 @@
 #define AC_INTEGRITY_MAX_IAT_SLOTS 65536u
 #define AC_INTEGRITY_MAX_HOOK_EVENTS 16u
 #define AC_KERNEL_MAX_IMAGE_OBSERVATIONS 256u
+#define AC_KERNEL_MAX_THREAD_OBSERVATIONS 256u
 #define AC_KERNEL_MAX_MISMATCH_EVENTS 32u
 #define AC_THREAT_DEDUP_CAPACITY 256u
+#define AC_MAX_DISPATCH_WATCHES 64u
+#define AC_MAX_VTABLE_ENTRIES 64u
 
 typedef enum AcSeverity {
     AC_SEVERITY_INFO,
@@ -69,6 +73,18 @@ typedef struct AcModuleList {
     bool truncated;
 } AcModuleList;
 
+typedef enum AcDispatchWatchKind {
+    AC_DISPATCH_FUNCTION_POINTER = 1,
+    AC_DISPATCH_OBJECT_VTABLE = 2
+} AcDispatchWatchKind;
+
+typedef struct AcDispatchWatch {
+    wchar_t module_name[128];
+    uint32_t slot_rva;
+    uint32_t entry_count;
+    AcDispatchWatchKind kind;
+} AcDispatchWatch;
+
 typedef struct AcPolicy {
     const wchar_t *allow_roots[AC_MAX_ALLOW_ROOTS];
     size_t allow_root_count;
@@ -82,6 +98,9 @@ typedef struct AcPolicy {
     bool hash_unknown_modules;
     bool probe_region_content;
     bool verify_module_integrity;
+    const AcManifest *manifest;
+    AcDispatchWatch dispatch_watches[AC_MAX_DISPATCH_WATCHES];
+    size_t dispatch_watch_count;
 } AcPolicy;
 
 typedef struct AcIntegritySection {
@@ -117,6 +136,7 @@ typedef struct AcIntegrityBaseline {
     bool ready;
     bool unavailable;
     bool identity_reported;
+    bool manifest_reported;
     const char *unavailable_reason;
 } AcIntegrityBaseline;
 
@@ -151,6 +171,9 @@ typedef struct AcScanStats {
     size_t integrity_modules_partial;
     size_t integrity_modules_skipped;
     size_t integrity_file_changes;
+    size_t dispatch_slots_checked;
+    size_t dispatch_targets_suspicious;
+    size_t dispatch_targets_unavailable;
     size_t region_events_omitted;
     uint64_t integrity_bytes;
     bool region_scan_truncated;
@@ -200,19 +223,24 @@ typedef struct AcOverlayFeatures {
 typedef struct AcThreatScanStats {
     size_t processes_visited;
     size_t device_names_visited;
+    size_t native_device_names_visited;
     size_t windows_visited;
     size_t indicators_observed;
     size_t overlay_candidates;
+    size_t indirect_dispatch_candidates;
     size_t events_emitted;
     size_t events_suppressed;
     bool process_inventory_complete;
     bool device_inventory_complete;
+    bool native_device_inventory_complete;
     bool window_inventory_complete;
 } AcThreatScanStats;
 
 typedef struct AcThreatSensor {
     AcDedup dedup;
     bool posture_reported;
+    bool driver_snapshot_reported;
+    bool input_posture_reported;
 } AcThreatSensor;
 
 typedef struct AcKernelImageObservation {
@@ -221,6 +249,13 @@ typedef struct AcKernelImageObservation {
     uint64_t image_size;
 } AcKernelImageObservation;
 
+typedef struct AcKernelThreadObservation {
+    uint64_t sequence;
+    uint64_t start_address;
+    uint32_t thread_id;
+    uint32_t creator_pid;
+} AcKernelThreadObservation;
+
 typedef struct AcKernelClient {
     HANDLE device;
     AcDriverVersion version;
@@ -228,8 +263,10 @@ typedef struct AcKernelClient {
     uint64_t last_sequence;
     uint64_t sequence_events_missing;
     uint64_t image_observations_omitted;
+    uint64_t thread_observations_omitted;
     uint64_t session_id;
     size_t image_observation_count;
+    size_t thread_observation_count;
     uint32_t last_callbacks_active;
     bool callback_state_initialized;
     bool queue_saturated;
@@ -237,6 +274,8 @@ typedef struct AcKernelClient {
     bool session_registered;
     AcKernelImageObservation image_observations[
         AC_KERNEL_MAX_IMAGE_OBSERVATIONS];
+    AcKernelThreadObservation thread_observations[
+        AC_KERNEL_MAX_THREAD_OBSERVATIONS];
 } AcKernelClient;
 
 bool ac_logger_open(
@@ -292,11 +331,21 @@ void ac_threat_sensor_report_posture(
     AcThreatSensor *sensor,
     AcLogger *logger,
     DWORD target_pid);
+void ac_threat_sensor_report_driver_snapshot(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid,
+    const AcManifest *manifest);
+void ac_threat_sensor_report_input_posture(
+    AcThreatSensor *sensor,
+    AcLogger *logger,
+    DWORD target_pid);
 void ac_threat_sensor_scan(
     AcThreatSensor *sensor,
     AcLogger *logger,
     DWORD target_pid,
     uint64_t scan_id,
+    const AcRangeIndex *module_ranges,
     AcThreatScanStats *stats_out);
 
 void ac_module_list_init(AcModuleList *modules);
@@ -312,6 +361,10 @@ bool ac_path_is_under_any(
     const wchar_t *path,
     const wchar_t **directories,
     size_t directory_count);
+bool ac_dispatch_watch_parse(
+    const wchar_t *specification,
+    AcDispatchWatchKind kind,
+    AcDispatchWatch *watch_out);
 
 void ac_policy_init_defaults(AcPolicy *policy);
 bool ac_context_init(AcContext *context, AcLogger *logger, const AcPolicy *policy);

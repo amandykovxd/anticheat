@@ -15,21 +15,21 @@ evadable; **closed** — the documented attack no longer works.
 
 ## A. Attacks on the collector process
 
-### A1. Terminate or suspend the collector — *open*
+### A1. Terminate or suspend the collector — *partial*
 
 The collector is a separate user-mode process with a fixed image name. A
 process at the same integrity level may call `TerminateProcess`, suspend every
 thread with `NtSuspendProcess`, or close its log handle.
 
-Cost: minutes. Detection: none locally. The gap between `scan_completed`
-records is the only trace, and it is only visible to a system that expects a
-cadence.
+Cost: minutes. Detection is remote rather than local: the transport sidecar
+registers a heartbeat interval and the reference receiver retains the last
+accepted chain head. Two missed heartbeat intervals are a session-integrity
+failure for the deployment.
 
-Countermeasure: the collector must not be the authority on its own liveness.
-Server-side session tracking with an expected heartbeat interval, plus
-`agent_stopped` correlation, converts termination into a missing-heartbeat
-signal. A watchdog service in a different session raises cost further but does
-not close the class while attacker and watchdog share a privilege level.
+Remaining gap: terminating both collector and sidecar still leaves only the
+server timeout as evidence. A watchdog service in a different session raises
+cost further but does not close the class while attacker and watchdog share a
+privilege level.
 
 ### A2. Patch the collector's own code — *open*
 
@@ -71,7 +71,7 @@ device so a losing collector can report who won.
 
 ### A4. Blind the driver through the IOCTL interface — *partial*
 
-Protocol v3 requires a nonzero random session ID. A different session cannot
+Protocol v4 requires a nonzero random session ID. A different session cannot
 replace or clear an active registration, and target changes no longer clear the
 queue. Compromise of the collector process still exposes the active session ID
 and device handle, so this does not defend against an equal-privilege attacker
@@ -142,20 +142,20 @@ server-side rule, not more code.
 
 ## C. Attacks on detection logic
 
-### C1. Drop the payload into an allowed root — *open*
+### C1. Drop the payload into an allowed root — *partial*
 
-`module_outside_allowed_roots` classifies by directory. Game directories are
-frequently writable by the user who runs the game. A DLL written next to the
-game executable is classified as expected. The collector now emits
-`module_identity_observed` with SHA-256 and stable file identity for every
-loader-visible module, including modules inside allowed roots, but no signed
-manifest is enforced locally yet.
+`module_outside_allowed_roots` still classifies by directory, but directory
+membership is no longer the authorization boundary when a pinned manifest is
+configured. The collector hashes loader-visible modules inside allowed roots
+and emits `module_manifest_violation` when a basename is absent or its SHA-256
+does not match. The same policy applies to the startup driver snapshot.
 
 This is the cheapest bypass in the system: copy the payload into the game
 folder and load it normally.
 
-Countermeasure: issue #12. The server must compare `module_identity_observed`
-with a signed manifest; directory membership is not authorization.
+Remaining gap: the expected manifest hash must arrive through the authenticated
+launcher/control-plane channel. A pin stored beside the manifest is not a
+trust anchor, and a compromised collector can skip the check.
 
 ### C2. Erase the PE header of a manual-mapped image — *partial*
 
@@ -196,21 +196,24 @@ Countermeasure: prioritise the cursor by module risk — the main executable and
 the modules a cheat must hook to be useful — instead of round-robin over all
 modules equally.
 
-### C5. Hook without modifying section bytes — *open*
+### C5. Hook without modifying section bytes — *partial*
 
 The integrity check compares section content and validates IAT and EAT targets.
-It does not cover:
+Integrators can additionally configure exact function-pointer slots and object
+VMT locations with `--watch-pointer` and `--watch-vtable`; the target WndProc
+is also checked against loader-visible module ranges. These checks cover known
+game-build dispatch points, not arbitrary writable dispatch metadata. Remaining
+gaps include:
 
-- indirect dispatch through function pointers in writable data (`.data`,
-  `.rdata` after `VirtualProtect`, vtables, callback registrations);
+- unconfigured function pointers, vtables, and callback registrations;
 - return-oriented payloads that execute only existing bytes;
 - the Control Flow Guard dispatch table;
 - exception-handler tables and TLS callbacks;
 - `KUSER_SHARED_DATA` and PEB-derived dispatch.
 
-Countermeasure: extend validation to non-executable sections that hold dispatch
-metadata. Vtable and callback validation is a large surface and belongs in a
-later milestone; state the gap rather than implying full coverage.
+Countermeasure: generate watch specifications from a signed per-build game
+manifest and reject missing or unreadable required watches. Broad scanning of
+all writable data is too noisy to be an authorization control.
 
 ### C6. Modify the file on disk after load — *partial*
 
@@ -267,7 +270,7 @@ expected and observed digests, and the differing bytes.
 
 The attacker's cheapest responses, in order:
 
-1. Move the hook to a data pointer instead of code (C5) — not covered.
+1. Move the hook to an unconfigured data pointer (C5) — partially covered.
 2. Hook only inside the interval where the module is not being validated
    (C4) — partially covered.
 3. Drop the payload into an allowed root and hook from there — the hook is
@@ -285,15 +288,15 @@ Ranked by attacker cost imposed per unit of engineering effort:
 
 | Rank | Work | Closes | Issue |
 | --- | --- | --- | --- |
-| 1 | Remote chain anchoring and heartbeat | B1, A1 | #14 |
-| 2 | Session-bound target registration | A4, C7 | #11 |
-| 3 | Signed identity manifest | C1, C6 | #12 |
+| 1 | Remote chain anchoring and heartbeat | B1, A1 | implemented |
+| 2 | Session-bound target registration | A4, C7 | partial; #11 remains |
+| 3 | Control-plane-pinned identity manifest | C1, C6 | implemented locally; launcher integration required |
 | 4 | Collector self-integrity with server nonce | A2 | — |
-| 5 | Randomised scan order and interval | B3, C3 | — |
+| 5 | Randomised scan order and interval | B3, C3 | interval and reservoir sampling implemented |
 | 6 | Risk-ordered integrity cursor | C4 | — |
-| 7 | Dispatch-metadata validation | C5 | — |
+| 7 | Dispatch-metadata validation | C5 | configured pointer/VMT watches implemented |
 
-Items 4, 5, and 6 have no issue yet and should get one.
+Collector nonce attestation and risk-ordered integrity scheduling remain open.
 
 No item in this table makes user-mode detection unevadable. They raise the cost
 from "one afternoon" to "sustained engineering", which is the only honest goal

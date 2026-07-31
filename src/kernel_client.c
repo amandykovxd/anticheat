@@ -2,9 +2,11 @@
 
 #include <bcrypt.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define AC_KERNEL_DRAIN_BATCH_LIMIT 32u
+#define AC_THREAD_QUERY_SET_WIN32_START_ADDRESS 9u
 
 static void ac_kernel_client_reset_health(AcKernelClient *client)
 {
@@ -13,6 +15,8 @@ static void ac_kernel_client_reset_health(AcKernelClient *client)
     client->sequence_events_missing = 0;
     client->image_observations_omitted = 0;
     client->image_observation_count = 0;
+    client->thread_observations_omitted = 0;
+    client->thread_observation_count = 0;
     client->last_callbacks_active = 0;
     client->callback_state_initialized = false;
     client->queue_saturated = false;
@@ -259,9 +263,87 @@ static const char *ac_kernel_event_name(uint32_t type, uint32_t flags)
             return (flags & AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE) != 0
                 ? "kernel_system_image_loaded"
                 : "kernel_image_loaded";
+        case AC_DRIVER_EVENT_PROCESS_HANDLE:
+            return "kernel_process_handle_requested";
+        case AC_DRIVER_EVENT_THREAD_CREATED:
+            return "kernel_thread_created";
+        case AC_DRIVER_EVENT_THREAD_EXITED:
+            return "kernel_thread_exited";
         default:
             return "kernel_event_unknown";
     }
+}
+
+static bool ac_kernel_process_path(
+    DWORD pid,
+    char *escaped_path,
+    size_t escaped_capacity)
+{
+    HANDLE process;
+    wchar_t *wide_path = NULL;
+    char path_utf8[MAX_PATH * 3u];
+    bool result = false;
+
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL) {
+        return false;
+    }
+    if (ac_get_process_path(process, &wide_path) &&
+        ac_wide_to_utf8(wide_path, path_utf8, sizeof(path_utf8))) {
+        result = ac_json_escape(
+            path_utf8,
+            escaped_path,
+            escaped_capacity);
+    }
+    free(wide_path);
+    CloseHandle(process);
+    return result;
+}
+
+static uint64_t ac_kernel_query_thread_start(uint32_t thread_id)
+{
+    typedef LONG (NTAPI *AcNtQueryInformationThread)(
+        HANDLE,
+        ULONG,
+        PVOID,
+        ULONG,
+        PULONG);
+    HMODULE ntdll;
+    AcNtQueryInformationThread query;
+    FARPROC procedure;
+    HANDLE thread;
+    PVOID start_address = NULL;
+    uint64_t result = 0;
+
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) {
+        return 0;
+    }
+    procedure = GetProcAddress(
+        ntdll,
+        "NtQueryInformationThread");
+    if (procedure == NULL || sizeof(query) != sizeof(procedure)) {
+        return 0;
+    }
+    memcpy(&query, &procedure, sizeof(query));
+
+    thread = OpenThread(
+        THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+        FALSE,
+        thread_id);
+    if (thread == NULL) {
+        return 0;
+    }
+    if (query(
+            thread,
+            AC_THREAD_QUERY_SET_WIN32_START_ADDRESS,
+            &start_address,
+            (ULONG)sizeof(start_address),
+            NULL) >= 0) {
+        result = (uint64_t)(uintptr_t)start_address;
+    }
+    CloseHandle(thread);
+    return result;
 }
 
 static void ac_kernel_event_path(
@@ -300,6 +382,84 @@ static void ac_log_kernel_event(
     char escaped_path[AC_DRIVER_IMAGE_PATH_CHARS * 6u];
     char details[4096];
 
+    if (event->type == AC_DRIVER_EVENT_PROCESS_HANDLE) {
+        const ACCESS_MASK original_access = (ACCESS_MASK)event->image_base;
+        const ACCESS_MASK observed_access = (ACCESS_MASK)event->image_size;
+        const ACCESS_MASK write_access =
+            PROCESS_TERMINATE |
+            PROCESS_CREATE_THREAD |
+            PROCESS_VM_OPERATION |
+            PROCESS_VM_WRITE |
+            PROCESS_DUP_HANDLE |
+            PROCESS_SUSPEND_RESUME;
+        const AcSeverity severity = (original_access & write_access) != 0
+            ? AC_SEVERITY_HIGH
+            : AC_SEVERITY_MEDIUM;
+
+        if (!ac_kernel_process_path(
+                event->process_id,
+                escaped_path,
+                sizeof(escaped_path))) {
+            (void)strcpy_s(
+                escaped_path,
+                sizeof(escaped_path),
+                "<unavailable>");
+        }
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"driver_sequence\":%" PRIu64
+            ",\"kernel_timestamp_100ns\":%" PRIu64
+            ",\"requestor_pid\":%u,\"target_pid\":%u,"
+            "\"operation\":\"%s\",\"original_access\":\"0x%08lx\","
+            "\"observed_access\":\"0x%08lx\",\"kernel_handle\":%s,"
+            "\"requestor_path\":\"%s\",\"source\":\"ob_callback\","
+            "\"verdict\":\"telemetry_only\"}",
+            event->sequence,
+            event->timestamp_100ns,
+            event->process_id,
+            event->parent_process_id,
+            (event->flags & AC_DRIVER_EVENT_FLAG_HANDLE_DUPLICATE) != 0
+                ? "duplicate" : "create",
+            (unsigned long)original_access,
+            (unsigned long)observed_access,
+            (event->flags & AC_DRIVER_EVENT_FLAG_KERNEL_HANDLE) != 0
+                ? "true" : "false",
+            escaped_path);
+        ac_log_event(
+            logger,
+            severity,
+            ac_kernel_event_name(event->type, event->flags),
+            event->parent_process_id,
+            details);
+        return;
+    }
+
+    if (event->type == AC_DRIVER_EVENT_THREAD_CREATED ||
+        event->type == AC_DRIVER_EVENT_THREAD_EXITED) {
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"driver_sequence\":%" PRIu64
+            ",\"kernel_timestamp_100ns\":%" PRIu64
+            ",\"thread_id\":%u,\"creator_pid\":%u,"
+            "\"start_address\":\"0x%" PRIx64
+            "\",\"source\":\"kernel_thread_callback\","
+            "\"verdict\":\"telemetry_only\"}",
+            event->sequence,
+            event->timestamp_100ns,
+            event->parent_process_id,
+            event->reserved,
+            event->image_base);
+        ac_log_event(
+            logger,
+            AC_SEVERITY_INFO,
+            ac_kernel_event_name(event->type, event->flags),
+            event->process_id,
+            details);
+        return;
+    }
+
     ac_kernel_event_path(
         event,
         escaped_path,
@@ -330,6 +490,35 @@ static void ac_log_kernel_event(
         ac_kernel_event_name(event->type, event->flags),
         event->process_id,
         details);
+}
+
+static void ac_kernel_client_observe_thread(
+    AcKernelClient *client,
+    AcDriverEvent *event,
+    DWORD target_pid)
+{
+    AcKernelThreadObservation *observation;
+
+    if (event->type != AC_DRIVER_EVENT_THREAD_CREATED ||
+        event->process_id != (uint32_t)target_pid) {
+        return;
+    }
+
+    event->image_base = ac_kernel_query_thread_start(
+        event->parent_process_id);
+    if (client->thread_observation_count >=
+        AC_KERNEL_MAX_THREAD_OBSERVATIONS) {
+        ++client->thread_observations_omitted;
+        client->telemetry_complete = false;
+        return;
+    }
+
+    observation = &client->thread_observations[
+        client->thread_observation_count++];
+    observation->sequence = event->sequence;
+    observation->start_address = event->image_base;
+    observation->thread_id = event->parent_process_id;
+    observation->creator_pid = event->reserved;
 }
 
 static void ac_kernel_client_observe_image(
@@ -411,14 +600,15 @@ bool ac_kernel_client_process_stats(
 
     if (!client->callback_state_initialized ||
         client->last_callbacks_active != stats->callbacks_active) {
-        if (stats->callbacks_active != 3u) {
+        if (stats->callbacks_active != AC_DRIVER_CALLBACK_REQUIRED) {
             char details[256];
             (void)snprintf(
                 details,
                 sizeof(details),
-                "{\"callbacks_active\":%u,\"expected_mask\":3,"
+                "{\"callbacks_active\":%u,\"expected_mask\":%u,"
                 "\"telemetry_complete\":false}",
-                stats->callbacks_active);
+                stats->callbacks_active,
+                AC_DRIVER_CALLBACK_REQUIRED);
             ac_log_event(
                 logger,
                 AC_SEVERITY_HIGH,
@@ -432,7 +622,7 @@ bool ac_kernel_client_process_stats(
                 AC_SEVERITY_INFO,
                 "kernel_callback_health_restored",
                 target_pid,
-                "{\"callbacks_active\":3}");
+                "{\"callbacks_active\":15}");
         }
         client->last_callbacks_active = stats->callbacks_active;
         client->callback_state_initialized = true;
@@ -564,6 +754,10 @@ bool ac_kernel_client_drain(
                 client,
                 &events[index],
                 target_pid);
+            ac_kernel_client_observe_thread(
+                client,
+                &events[index],
+                target_pid);
             ac_log_kernel_event(logger, &events[index]);
             ++total;
         }
@@ -593,12 +787,20 @@ void ac_kernel_client_correlate_scan(
 {
     size_t index;
     size_t mismatches = 0;
-    size_t reported = 0;
+    size_t image_reported = 0;
+    size_t suspicious_threads = 0;
+    size_t thread_reported = 0;
     const size_t observations = client != NULL
         ? client->image_observation_count
         : 0;
     const uint64_t omitted = client != NULL
         ? client->image_observations_omitted
+        : 0;
+    const size_t thread_observations = client != NULL
+        ? client->thread_observation_count
+        : 0;
+    const uint64_t thread_omitted = client != NULL
+        ? client->thread_observations_omitted
         : 0;
 
     if (client == NULL || logger == NULL || module_ranges == NULL) {
@@ -619,7 +821,7 @@ void ac_kernel_client_correlate_scan(
         }
 
         ++mismatches;
-        if (reported < AC_KERNEL_MAX_MISMATCH_EVENTS) {
+        if (image_reported < AC_KERNEL_MAX_MISMATCH_EVENTS) {
             char details[512];
             (void)snprintf(
                 details,
@@ -642,22 +844,72 @@ void ac_kernel_client_correlate_scan(
                 "kernel_user_module_mismatch",
                 target_pid,
                 details);
-            ++reported;
+            ++image_reported;
         }
     }
 
-    if (omitted > 0 || mismatches > reported) {
+    for (index = 0; index < thread_observations; ++index) {
+        const AcKernelThreadObservation *observation =
+            &client->thread_observations[index];
+
+        if (observation->start_address != 0 &&
+            observation->start_address <= (uint64_t)UINTPTR_MAX &&
+            ac_range_index_contains(
+                module_ranges,
+                (uintptr_t)observation->start_address,
+                1u)) {
+            continue;
+        }
+
+        ++suspicious_threads;
+        if (thread_reported < AC_KERNEL_MAX_MISMATCH_EVENTS) {
+            char details[512];
+            (void)snprintf(
+                details,
+                sizeof(details),
+                "{\"scan_id\":%" PRIu64
+                ",\"driver_sequence\":%" PRIu64
+                ",\"thread_id\":%u,\"creator_pid\":%u,"
+                "\"start_address\":\"0x%" PRIx64
+                "\",\"reason\":\"thread_start_outside_loader_modules\","
+                "\"start_address_available\":%s}",
+                scan_id,
+                observation->sequence,
+                observation->thread_id,
+                observation->creator_pid,
+                observation->start_address,
+                observation->start_address != 0 ? "true" : "false");
+            ac_log_event(
+                logger,
+                observation->start_address != 0
+                    ? AC_SEVERITY_HIGH : AC_SEVERITY_LOW,
+                observation->start_address != 0
+                    ? "kernel_thread_start_unlinked"
+                    : "kernel_thread_start_unavailable",
+                target_pid,
+                details);
+            ++thread_reported;
+        }
+    }
+
+    if (omitted > 0 || thread_omitted > 0 ||
+        mismatches > image_reported ||
+        suspicious_threads > thread_reported) {
         char details[384];
         (void)snprintf(
             details,
             sizeof(details),
             "{\"scan_id\":%" PRIu64
             ",\"observations_omitted\":%" PRIu64
+            ",\"thread_observations_omitted\":%" PRIu64
             ",\"mismatch_events_omitted\":%zu,"
+            "\"thread_events_omitted\":%zu,"
             "\"telemetry_complete\":false}",
             scan_id,
             omitted,
-            mismatches - reported);
+            thread_omitted,
+            mismatches - image_reported,
+            suspicious_threads - thread_reported);
         ac_log_event(
             logger,
             AC_SEVERITY_HIGH,
@@ -691,7 +943,31 @@ void ac_kernel_client_correlate_scan(
             details);
     }
 
-    if (mismatches > 0) {
+    if (thread_observations > 0 || thread_omitted > 0) {
+        char details[512];
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"scan_id\":%" PRIu64
+            ",\"threads_observed\":%zu,"
+            "\"starts_inside_loader_modules\":%zu,"
+            "\"starts_suspicious_or_unavailable\":%zu,"
+            "\"observations_omitted\":%" PRIu64 "}",
+            scan_id,
+            thread_observations,
+            thread_observations - suspicious_threads,
+            suspicious_threads,
+            thread_omitted);
+        ac_log_event(
+            logger,
+            AC_SEVERITY_INFO,
+            "kernel_thread_scan_correlation",
+            target_pid,
+            details);
+    }
+
+    if (mismatches > 0 || suspicious_threads > 0 ||
+        thread_omitted > 0) {
         client->telemetry_complete = false;
     }
     if (mismatches_out != NULL) {
@@ -699,4 +975,6 @@ void ac_kernel_client_correlate_scan(
     }
     client->image_observation_count = 0;
     client->image_observations_omitted = 0;
+    client->thread_observation_count = 0;
+    client->thread_observations_omitted = 0;
 }

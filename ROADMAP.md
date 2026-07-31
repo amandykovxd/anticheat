@@ -9,7 +9,7 @@ Implemented:
 
 - x64 WDM telemetry driver source;
 - restricted, exclusive device object;
-- process and image-load callbacks;
+- process, image-load, thread, and process-handle callbacks;
 - one-PID target filter;
 - bounded kernel event queue with dropped-event accounting;
 - versioned fixed-size IOCTL protocol;
@@ -19,29 +19,32 @@ Implemented:
 - content and file hashing under explicit budgets;
 - event de-duplication;
 - JSONL rotation and SHA-256 integrity chain;
-- portable unit tests and Windows integration tests.
+- portable unit tests and Windows integration tests;
+- Release macOS and Linux user-mode collectors;
+- WDK NuGet restore and x64 driver CI artifact;
+- authenticated transport, bounded spool, heartbeat, and remote chain anchors;
+- control-plane-pinned module and driver manifest enforcement;
+- PE section, IAT, EAT, configured function-pointer, and VMT validation.
 
 Not yet completed:
 
 - production driver package signing;
-- WDK CI build;
 - Driver Verifier and HLK validation;
 - KMDF migration evaluation;
-- signed application manifest;
-- server transport and collector reference implementation;
+- offline public-key manifest signatures, expiry, and rollback protection;
 - measured compatibility and false-positive datasets.
 
-## Milestone 1: kernel build and verification pipeline
+## Milestone 1: kernel build and verification pipeline — partial
 
 Deliverables:
 
-- WDK-based CI image with a pinned SDK/WDK version;
-- `msbuild` of `driver/AcTelemetry.vcxproj`;
+- WDK NuGet restore with a pinned SDK/WDK dependency set — implemented;
+- `msbuild` of `driver/AcTelemetry.vcxproj` — implemented;
 - `InfVerif` validation of `driver/AcTelemetry.inf`;
 - test catalog generation;
 - static driver analysis;
 - CodeQL or equivalent analysis for user-mode code;
-- published unsigned development artifacts with SHA-256 checksums;
+- published unsigned development artifacts with SHA-256 checksums — implemented;
 - symbol artifact retention.
 
 Acceptance criteria:
@@ -117,7 +120,13 @@ Acceptance criteria:
 - a second client cannot replace the active target;
 - all target transitions are represented in the event stream.
 
-## Milestone 5: signed application manifest
+## Milestone 5: signed application manifest — partial
+
+The current collector verifies a control-plane-supplied SHA-256 pin and applies
+the manifest to every loader-visible module baseline and the startup kernel
+driver snapshot. The remaining work below adds portable offline signature and
+rollback semantics; a local file containing both manifest and pin is not an
+acceptable trust anchor.
 
 Deliverables:
 
@@ -137,7 +146,7 @@ Acceptance criteria:
 - manifest updates do not require collector or driver recompilation;
 - rollback to an expired manifest is detected.
 
-## Milestone 6: PE-aware integrity
+## Milestone 6: PE-aware integrity — implemented baseline
 
 Deliverables:
 
@@ -156,7 +165,7 @@ Acceptance criteria:
 - malformed PE inputs do not crash or exceed configured resource limits;
 - integrity scanning remains outside kernel callbacks.
 
-## Milestone 7: event transport and remote verification
+## Milestone 7: event transport and remote verification — implemented baseline
 
 Deliverables:
 

@@ -277,6 +277,85 @@ bool ac_path_is_under_any(
     return false;
 }
 
+bool ac_dispatch_watch_parse(
+    const wchar_t *specification,
+    AcDispatchWatchKind kind,
+    AcDispatchWatch *watch_out)
+{
+    const wchar_t *plus;
+    const wchar_t *colon;
+    const wchar_t *rva_end;
+    wchar_t number[32];
+    wchar_t *end = NULL;
+    unsigned long long value;
+    size_t module_length;
+    size_t number_length;
+
+    if (specification == NULL || watch_out == NULL ||
+        (kind != AC_DISPATCH_FUNCTION_POINTER &&
+         kind != AC_DISPATCH_OBJECT_VTABLE)) {
+        return false;
+    }
+    plus = wcschr(specification, L'+');
+    colon = wcsrchr(specification, L':');
+    if (plus == NULL || plus == specification ||
+        wcschr(plus + 1u, L'+') != NULL) {
+        return false;
+    }
+    if (kind == AC_DISPATCH_OBJECT_VTABLE) {
+        if (colon == NULL || colon <= plus + 1u || colon[1] == L'\0') {
+            return false;
+        }
+        rva_end = colon;
+    } else {
+        if (colon != NULL) {
+            return false;
+        }
+        rva_end = specification + wcslen(specification);
+    }
+
+    module_length = (size_t)(plus - specification);
+    if (module_length >=
+            sizeof(watch_out->module_name) /
+                sizeof(watch_out->module_name[0]) ||
+        wmemchr(specification, L'\\', module_length) != NULL ||
+        wmemchr(specification, L'/', module_length) != NULL ||
+        wmemchr(specification, L':', module_length) != NULL) {
+        return false;
+    }
+
+    number_length = (size_t)(rva_end - (plus + 1u));
+    if (number_length == 0 ||
+        number_length >= sizeof(number) / sizeof(number[0])) {
+        return false;
+    }
+    wmemcpy(number, plus + 1u, number_length);
+    number[number_length] = L'\0';
+    value = wcstoull(number, &end, 0);
+    if (end == number || *end != L'\0' || value > UINT32_MAX) {
+        return false;
+    }
+
+    memset(watch_out, 0, sizeof(*watch_out));
+    wmemcpy(watch_out->module_name, specification, module_length);
+    watch_out->module_name[module_length] = L'\0';
+    watch_out->slot_rva = (uint32_t)value;
+    watch_out->kind = kind;
+
+    if (kind == AC_DISPATCH_OBJECT_VTABLE) {
+        value = wcstoull(colon + 1u, &end, 10);
+        if (end == colon + 1u || *end != L'\0' || value == 0 ||
+            value > AC_MAX_VTABLE_ENTRIES) {
+            memset(watch_out, 0, sizeof(*watch_out));
+            return false;
+        }
+        watch_out->entry_count = (uint32_t)value;
+    } else {
+        watch_out->entry_count = 1u;
+    }
+    return true;
+}
+
 void ac_policy_init_defaults(AcPolicy *policy)
 {
     if (policy == NULL) {
@@ -746,6 +825,305 @@ static void ac_scan_memory_regions(
     }
 }
 
+static const wchar_t *ac_module_base_name(const wchar_t *path)
+{
+    const wchar_t *separator;
+
+    separator = path != NULL ? wcsrchr(path, L'\\') : NULL;
+    return separator != NULL ? separator + 1u : path;
+}
+
+static const AcModule *ac_find_module_by_name(
+    const AcModuleList *modules,
+    const wchar_t *module_name)
+{
+    size_t index;
+
+    for (index = 0; index < modules->count; ++index) {
+        const wchar_t *base_name = ac_module_base_name(
+            modules->items[index].path);
+        if (base_name != NULL &&
+            _wcsicmp(base_name, module_name) == 0) {
+            return &modules->items[index];
+        }
+    }
+    return NULL;
+}
+
+static bool ac_read_remote_pointer(
+    HANDLE process,
+    uintptr_t address,
+    uintptr_t *value_out)
+{
+    SIZE_T read_bytes = 0;
+
+    *value_out = 0;
+    return ReadProcessMemory(
+               process,
+               (LPCVOID)address,
+               value_out,
+               sizeof(*value_out),
+               &read_bytes) &&
+           read_bytes == sizeof(*value_out);
+}
+
+static void ac_report_dispatch_watch(
+    AcContext *context,
+    const AcTarget *target,
+    uint64_t scan_id,
+    const AcDispatchWatch *watch,
+    const char *event,
+    const char *reason,
+    uintptr_t slot,
+    uintptr_t table,
+    uint32_t entry,
+    uintptr_t destination,
+    AcSeverity severity,
+    AcScanStats *stats)
+{
+    AcDedupDecision decision;
+    char module_utf8[384];
+    char escaped_module[768];
+    char details[1536];
+    uint64_t fingerprint;
+
+    if (!ac_wide_to_utf8(
+            watch->module_name,
+            module_utf8,
+            sizeof(module_utf8))) {
+        (void)strcpy_s(
+            module_utf8,
+            sizeof(module_utf8),
+            "<conversion-failed>");
+    }
+    fingerprint = ac_fnv1a64_text(AC_FNV1A64_OFFSET, event);
+    fingerprint = ac_fnv1a64_text_ci(fingerprint, module_utf8);
+    fingerprint = ac_fnv1a64_continue(
+        fingerprint,
+        &watch->slot_rva,
+        sizeof(watch->slot_rva));
+    fingerprint = ac_fnv1a64_continue(
+        fingerprint,
+        &entry,
+        sizeof(entry));
+    fingerprint = ac_fnv1a64_continue(
+        fingerprint,
+        &destination,
+        sizeof(destination));
+    ac_dedup_observe(
+        &context->dedup,
+        fingerprint,
+        scan_id,
+        GetTickCount64(),
+        &decision);
+    if (!decision.emit) {
+        ++stats->suppressed;
+        return;
+    }
+
+    (void)ac_json_escape(
+        module_utf8,
+        escaped_module,
+        sizeof(escaped_module));
+    (void)snprintf(
+        details,
+        sizeof(details),
+        "{\"scan_id\":%" PRIu64 ",\"module\":\"%s\","
+        "\"slot_rva\":\"0x%08x\",\"slot\":\"0x%" PRIxPTR
+        "\",\"table\":\"0x%" PRIxPTR "\",\"entry\":%u,"
+        "\"destination\":\"0x%" PRIxPTR "\",\"reason\":\"%s\","
+        "\"verdict\":\"signal_only\"}",
+        scan_id,
+        escaped_module,
+        watch->slot_rva,
+        slot,
+        table,
+        entry,
+        destination,
+        reason);
+    ac_log_event(
+        context->logger,
+        severity,
+        event,
+        target->pid,
+        details);
+    ++stats->emitted;
+}
+
+static void ac_scan_dispatch_watches(
+    AcContext *context,
+    const AcTarget *target,
+    uint64_t scan_id,
+    AcScanStats *stats)
+{
+    size_t watch_index;
+    size_t findings_reported = 0;
+
+    for (watch_index = 0;
+         watch_index < context->policy.dispatch_watch_count;
+         ++watch_index) {
+        const AcDispatchWatch *watch =
+            &context->policy.dispatch_watches[watch_index];
+        const AcModule *module = ac_find_module_by_name(
+            &context->modules,
+            watch->module_name);
+        uintptr_t slot;
+        uintptr_t first_pointer;
+
+        if (module == NULL || watch->slot_rva > module->size ||
+            module->size - watch->slot_rva < sizeof(uintptr_t)) {
+            ++stats->dispatch_targets_unavailable;
+            if (findings_reported < AC_INTEGRITY_MAX_HOOK_EVENTS) {
+                ac_report_dispatch_watch(
+                    context,
+                    target,
+                    scan_id,
+                    watch,
+                    "dispatch_watch_unavailable",
+                    module == NULL
+                        ? "module_not_loaded"
+                        : "slot_outside_module",
+                    0,
+                    0,
+                    0,
+                    0,
+                    AC_SEVERITY_LOW,
+                    stats);
+                ++findings_reported;
+            }
+            continue;
+        }
+
+        slot = module->base + watch->slot_rva;
+        if (!ac_read_remote_pointer(
+                target->process,
+                slot,
+                &first_pointer)) {
+            ++stats->dispatch_targets_unavailable;
+            continue;
+        }
+        ++stats->dispatch_slots_checked;
+
+        if (watch->kind == AC_DISPATCH_FUNCTION_POINTER) {
+            if (first_pointer != 0 && !ac_range_index_contains(
+                    &context->module_ranges,
+                    first_pointer,
+                    1u)) {
+                ++stats->dispatch_targets_suspicious;
+                if (findings_reported < AC_INTEGRITY_MAX_HOOK_EVENTS) {
+                    ac_report_dispatch_watch(
+                        context,
+                        target,
+                        scan_id,
+                        watch,
+                        "dispatch_pointer_outside_loader_modules",
+                        "function_pointer_target_unlinked",
+                        slot,
+                        0,
+                        0,
+                        first_pointer,
+                        AC_SEVERITY_HIGH,
+                        stats);
+                    ++findings_reported;
+                }
+            }
+            continue;
+        }
+
+        if (first_pointer != 0) {
+            uintptr_t table;
+            uint32_t entry;
+
+            if (!ac_read_remote_pointer(
+                    target->process,
+                    first_pointer,
+                    &table) || table == 0) {
+                ++stats->dispatch_targets_unavailable;
+                continue;
+            }
+            if (!ac_range_index_contains(
+                    &context->module_ranges,
+                    table,
+                    sizeof(uintptr_t))) {
+                ++stats->dispatch_targets_suspicious;
+                if (findings_reported < AC_INTEGRITY_MAX_HOOK_EVENTS) {
+                    ac_report_dispatch_watch(
+                        context,
+                        target,
+                        scan_id,
+                        watch,
+                        "vtable_storage_outside_loader_modules",
+                        "object_vtable_relocated_to_private_memory",
+                        slot,
+                        table,
+                        0,
+                        table,
+                        AC_SEVERITY_HIGH,
+                        stats);
+                    ++findings_reported;
+                }
+            }
+
+            for (entry = 0; entry < watch->entry_count; ++entry) {
+                uintptr_t destination;
+                if (table > UINTPTR_MAX -
+                        (uintptr_t)entry * sizeof(uintptr_t) ||
+                    !ac_read_remote_pointer(
+                        target->process,
+                        table + (uintptr_t)entry * sizeof(uintptr_t),
+                        &destination)) {
+                    ++stats->dispatch_targets_unavailable;
+                    break;
+                }
+                ++stats->dispatch_slots_checked;
+                if (destination == 0 || ac_range_index_contains(
+                        &context->module_ranges,
+                        destination,
+                        1u)) {
+                    continue;
+                }
+                ++stats->dispatch_targets_suspicious;
+                if (findings_reported < AC_INTEGRITY_MAX_HOOK_EVENTS) {
+                    ac_report_dispatch_watch(
+                        context,
+                        target,
+                        scan_id,
+                        watch,
+                        "vtable_entry_outside_loader_modules",
+                        "vtable_entry_target_unlinked",
+                        slot,
+                        table,
+                        entry,
+                        destination,
+                        AC_SEVERITY_HIGH,
+                        stats);
+                    ++findings_reported;
+                }
+            }
+        }
+    }
+
+    if (stats->dispatch_targets_suspicious > findings_reported) {
+        char details[384];
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"scan_id\":%" PRIu64 ",\"findings\":%zu,"
+            "\"events_emitted_or_deduplicated\":%zu,"
+            "\"reason\":\"dispatch_event_budget_exhausted\"}",
+            scan_id,
+            stats->dispatch_targets_suspicious,
+            findings_reported);
+        ac_log_event(
+            context->logger,
+            AC_SEVERITY_MEDIUM,
+            "dispatch_watch_coverage_gap",
+            target->pid,
+            details);
+        ++stats->emitted;
+    }
+}
+
 bool ac_scan_process(
     AcContext *context,
     const AcTarget *target,
@@ -796,6 +1174,7 @@ bool ac_scan_process(
     }
 
     ac_scan_memory_regions(context, target, scan_id, &stats);
+    ac_scan_dispatch_watches(context, target, scan_id, &stats);
     ac_verify_module_integrity(context, target, scan_id, &stats);
 
     stats.duration_ms = (uint64_t)(GetTickCount64() - started_ms);
@@ -811,6 +1190,10 @@ bool ac_scan_process(
         stats.integrity_unreadable_blocks == 0 &&
         stats.integrity_modules_partial == 0 &&
         stats.integrity_modules_skipped == 0;
+    if (context->policy.dispatch_watch_count > 0 &&
+        stats.dispatch_targets_unavailable > 0) {
+        stats.coverage_complete = false;
+    }
     ++context->scans_completed;
 
     if (!stats.coverage_complete) {
@@ -826,6 +1209,7 @@ bool ac_scan_process(
             "\"integrity_unreadable_blocks\":%zu,"
             "\"integrity_modules_partial\":%zu,"
             "\"integrity_modules_skipped\":%zu,"
+            "\"dispatch_targets_unavailable\":%zu,"
             "\"possible_user_mode_api_interference\":%s,"
             "\"reason\":\"scan_coverage_incomplete\"}",
             scan_id,
@@ -840,6 +1224,7 @@ bool ac_scan_process(
             stats.integrity_unreadable_blocks,
             stats.integrity_modules_partial,
             stats.integrity_modules_skipped,
+            stats.dispatch_targets_unavailable,
             (context->modules.count == 0 ||
              stats.query_failures > 0 ||
              stats.read_failures > 0 ||
@@ -872,6 +1257,9 @@ bool ac_scan_process(
         "\"integrity_export_slots_checked\":%zu,\"integrity_export_hooks\":%zu,"
         "\"integrity_modules_partial\":%zu,\"integrity_modules_skipped\":%zu,"
         "\"integrity_file_changes\":%zu,\"region_events_omitted\":%zu,"
+        "\"dispatch_slots_checked\":%zu,"
+        "\"dispatch_targets_suspicious\":%zu,"
+        "\"dispatch_targets_unavailable\":%zu,"
         "\"region_scan_truncated\":%s,\"integrity_bytes\":%" PRIu64
         ",\"integrity_baselines\":%zu,\"complete\":%s,"
         "\"source\":\"user_mode_win32_api\","
@@ -904,6 +1292,9 @@ bool ac_scan_process(
         stats.integrity_modules_skipped,
         stats.integrity_file_changes,
         stats.region_events_omitted,
+        stats.dispatch_slots_checked,
+        stats.dispatch_targets_suspicious,
+        stats.dispatch_targets_unavailable,
         stats.region_scan_truncated ? "true" : "false",
         stats.integrity_bytes,
         context->integrity.count,

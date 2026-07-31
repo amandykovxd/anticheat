@@ -6,7 +6,8 @@
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#supported-configurations)
 [![Language: C11](https://img.shields.io/badge/language-C11-555555.svg)](CMakeLists.txt)
 
-Anticheat Telemetry is a Windows process-integrity sensor composed of:
+Anticheat Telemetry is a Windows process-integrity sensor with reduced-scope
+macOS and Linux collectors, composed of:
 
 - `AcTelemetry.sys`: optional x64 kernel telemetry driver;
 - `anticheat.exe`: user-mode collector and process-memory scanner;
@@ -15,9 +16,9 @@ Anticheat Telemetry is a Windows process-integrity sensor composed of:
 - `tools/verify_log.py`: JSONL integrity-chain verifier;
 - a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
-The kernel driver records process lifecycle and image-load notifications for
-one registered process ID and records subsequent system-mode image loads while
-that session is active. The user-mode collector inventories modules, maps
+The kernel driver records process, image, thread, and foreign process-handle
+notifications for one registered process ID and records subsequent system-mode
+image loads while that session is active. The user-mode collector inventories modules, maps
 executable memory, classifies regions not backed by loader-visible modules,
 correlates system-security posture, known kernel-device indicators, and
 external overlay behavior, applies event de-duplication, and writes a
@@ -32,6 +33,8 @@ modify target memory, block image loads, or issue enforcement decisions.
 Windows kernel
   PsSetCreateProcessNotifyRoutineEx
   PsSetLoadImageNotifyRoutine
+  PsSetCreateThreadNotifyRoutine
+  ObRegisterCallbacks (telemetry only)
                |
                v
   AcTelemetry.sys bounded event queue
@@ -61,17 +64,19 @@ integrator-owned correlation and policy
 
 The driver and collector use the shared ABI defined in
 [`include/ac_driver_protocol.h`](include/ac_driver_protocol.h). The driver
-device is exclusive and accessible only to `SYSTEM`. Protocol v3 binds target
+device is exclusive and accessible only to `SYSTEM`. Protocol v4 binds target
 registration to a cryptographically random collector session identifier and
-uses session-scoped queue counters and sequence numbers.
+uses session-scoped queue counters and sequence numbers. The fixed 584-byte
+event record also carries thread and foreign-handle observations.
 
 ## Supported configurations
 
 | Component | Architecture | Build requirement |
 | --- | --- | --- |
-| Kernel driver | x64 | Visual Studio, matching Windows SDK and WDK |
+| Kernel driver | x64 | Visual Studio 2022; WDK 26100 is restored from the pinned NuGet package |
 | User-mode collector | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
 | macOS user-mode collector | Apple Silicon, Intel | Xcode Command Line Tools and CMake 3.24+ |
+| Linux procfs collector | x64, ARM64 | C11 compiler, procfs, and CMake 3.24+ |
 | Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
 | Transport sidecar and reference receiver | Linux, macOS, Windows | Python 3.10+ |
 | Log verifier | Platform-independent | Python 3.10+ |
@@ -121,17 +126,19 @@ The executable is generated at:
 build\Release\anticheat.exe
 ```
 
-The normal CI matrix builds and tests x64 and Win32 collectors. The portable
-core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
+The CI matrix builds and tests x64 and Win32 collectors, the x64 WDK driver,
+and Release macOS and Linux collectors. The portable core and Linux collector
+are additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Automated test inventory
 
-Windows builds register 44 independent CTest cases: 17 portable algorithms,
-23 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
+Windows builds register 52 independent CTest cases: 17 portable algorithms,
+31 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
 macOS builds register 23 cases: 17 portable cases, 3 CLI contracts, one live
 self-scan, one suspicious-region integration test, and the transport suite.
-Linux sanitizer builds register 18 cases:
-17 portable cases and the transport suite. The transport CTest entry contains
+Linux sanitizer builds register 22 cases: 17 portable cases, 3 Linux collector
+contracts, one suspicious-mapping integration test, and the transport suite.
+The transport CTest entry contains
 22 protocol, persistence, tamper, authentication, rotation, and backpressure
 tests.
 
@@ -148,9 +155,9 @@ ctest --preset windows-x64-release -L portable
 ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 ```
 
-The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
+The available labels include `portable`, `core`, `cli`, `windows`, `macos`, `linux`,
 `transport`, and `integration`. The Windows CI matrix rejects a configuration
-that does not expose exactly 44 independent CTest entries.
+that does not expose exactly 52 independent CTest entries.
 
 ## Build and run on macOS
 
@@ -222,15 +229,36 @@ Integrity Protection, process ownership, and platform privacy controls may
 limit metadata visibility for unrelated processes. See
 [docs/macos-integration.md](docs/macos-integration.md).
 
+## Build and run on Linux
+
+The Linux target is a procfs collector. It inventories executable mappings,
+`TracerPid`, foreign file descriptors referring to `/proc/<target>/mem`, and
+processes holding `/dev/uinput`. It does not claim visibility into
+`process_vm_readv` or `process_vm_writev`; reliable observation of those calls
+requires an integrator-owned eBPF LSM or audit sensor.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/anticheat --pid 1234 --once --log anticheat-events.jsonl
+```
+
+The collector emits `linux_kernel_audit_unavailable` when the kernel audit
+layer is not integrated. A backend must treat that record as a coverage gap,
+not as evidence that cross-process memory access did not occur.
+
 ## Build the kernel driver
 
-Install Visual Studio with Desktop C++ support and a matching Windows SDK/WDK
-pair. Microsoft requires matching SDK and WDK build numbers.
+Install Visual Studio 2022 with Desktop C++ support. The project pins
+`Microsoft.Windows.WDK.x64` `10.0.26100.6584`; package restore supplies the
+matching WDK and SDK build inputs used by CI.
 
 From a Developer Command Prompt:
 
 ```powershell
 msbuild driver\AcTelemetry.vcxproj `
+  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```
@@ -241,7 +269,8 @@ Expected output:
 driver\x64\Release\AcTelemetry.sys
 ```
 
-The project does not enable production signing. Development systems must use a
+The CI artifact is explicitly named `AcTelemetry-unsigned-x64`; it is a build
+input, not a deployable production package. Development systems must use a
 test-signed package and an isolated test configuration. Production deployment
 requires a signed catalog and a driver package accepted by the applicable
 Microsoft signing process.
@@ -249,6 +278,7 @@ Microsoft signing process.
 Microsoft references:
 
 - [Download and install the WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk)
+- [Restore the WDK from NuGet](https://learn.microsoft.com/windows-hardware/drivers/install-the-wdk-using-nuget)
 - [Build a driver with MSBuild](https://learn.microsoft.com/windows-hardware/drivers/develop/building-a-driver)
 - [Driver package components](https://learn.microsoft.com/windows-hardware/drivers/install/components-of-a-driver-package)
 - [Test-signing driver packages](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-driver-packages)
@@ -320,10 +350,25 @@ privileges when the target process ACL permits read access.
 
 ## Integration sequence
 
+Generate a deployment manifest containing exact module and driver file names
+and SHA-256 values. The manifest format is intentionally line-oriented:
+
+```text
+ac-manifest-v1
+module <64-hex-sha256> game.exe
+module <64-hex-sha256> client.dll
+driver <64-hex-sha256> AcTelemetry.sys
+```
+
+Deliver the manifest hash over the authenticated launcher/control-plane
+channel. Do not read the expected hash from a file stored beside the manifest;
+that would allow an endpoint attacker to replace both values.
+
 1. Build and sign `AcTelemetry.sys` for the target Windows release.
 2. Install and start the `AcTelemetry` driver service during product setup.
 3. Start the protected application and retain its PID and process handle.
-4. Start `anticheat.exe --pid <pid> --require-kernel`.
+4. Start the collector with `--pid`, `--require-kernel`,
+   `--require-manifest`, `--manifest`, and `--manifest-sha256`.
 5. Start `tools/telemetry_shipper.py` against the JSONL path and an
    authenticated HTTPS receiver.
 6. Confirm server session registration, batch acknowledgements, and heartbeat
@@ -364,6 +409,11 @@ state at the next scan.
 | `--repeat-interval-ms <n>` | Re-emit a de-duplicated finding after `n` milliseconds. |
 | `--no-module-hashes` | Disable SHA-256 calculation for modules outside allowed roots. |
 | `--no-region-probe` | Disable content probing of suspicious executable regions. |
+| `--watch-pointer <module+rva>` | Validate a game-specific function-pointer slot against loader-visible module ranges. Repeatable. |
+| `--watch-vtable <module+rva:entries>` | Resolve an object pointer stored at the module RVA and validate its VMT storage and entries. Repeatable. |
+| `--manifest <path>` | Load the module and driver authorization manifest. |
+| `--manifest-sha256 <hex>` | Pin the manifest to a SHA-256 value supplied by the control plane. |
+| `--require-manifest` | Exit when the pinned manifest is absent or invalid. |
 | `--log <path>` | Set the JSONL output path. |
 | `--max-log-bytes <n>` | Rotate the active log after `n` bytes. `0` disables rotation. |
 | `--log-generations <n>` | Set the number of retained rotated segments. |
@@ -378,9 +428,9 @@ with it; a conflicting invocation exits with code `2`.
 The output is a stable, line-oriented contract:
 
 ```text
-collector_version=0.3.0
+collector_version=0.4.0
 event_schema_version=5
-driver_protocol_version=3
+driver_protocol_version=4
 ```
 
 Integrators must parse the keys rather than depend on a fixed numeric value.
@@ -436,6 +486,11 @@ Kernel-originated records contain the driver's independent sequence number and
 - `kernel_process_exited`;
 - `kernel_image_loaded`;
 - `kernel_system_image_loaded`;
+- `kernel_process_handle_requested`;
+- `kernel_thread_created`;
+- `kernel_thread_exited`;
+- `kernel_thread_start_unlinked`;
+- `kernel_thread_scan_correlation`;
 - `kernel_event_queue_saturated`;
 - `kernel_event_queue_overflow`;
 - `kernel_event_sequence_gap`;
@@ -444,6 +499,13 @@ Kernel-originated records contain the driver's independent sequence number and
 - `kernel_user_scan_correlation`;
 - `kernel_event_read_failed`;
 - `kernel_attack_surface_posture`;
+- `loaded_kernel_driver_observed`;
+- `kernel_driver_manifest_violation`;
+- `module_manifest_violation`;
+- `target_wndproc_outside_loader_modules`;
+- `dispatch_pointer_outside_loader_modules`;
+- `vtable_storage_outside_loader_modules`;
+- `vtable_entry_outside_loader_modules`;
 - `known_threat_indicator_observed`;
 - `external_overlay_candidate`;
 - `threat_sensor_scan_completed`.
@@ -476,6 +538,11 @@ python tools\verify_log.py `
 - The driver reports image loads for the active PID, system-mode images loaded
   after session registration, direct child-process creation, and target exit.
   It clears the active PID after recording exit.
+- The handle callback records dangerous process access requested by foreign
+  processes. It does not alter `DesiredAccess`, close handles, or block the
+  operation.
+- Thread callbacks record lifecycle IDs. The collector queries the Win32 start
+  address and correlates it with the next loader-visible module snapshot.
 - Kernel callbacks report image mappings; they do not inspect or modify image
   contents.
 - The driver does not enumerate image mappings that occurred before target
@@ -503,6 +570,9 @@ src/
   process.c               target discovery and identity validation
   scanner.c               module and memory telemetry
   threat_sensor.c         posture, kernel-device, process, and overlay signals
+  manifest.c              pinned module and driver authorization manifest
+  manifest.h              manifest parser and match contract
+  linux_main.c            Linux procfs, ptrace, mapping, and uinput sensor
   integrity.c             PE section, import and export validation
   log.c                   JSONL output, rotation, integrity chain
   dedup.c                 bounded finding de-duplication
@@ -528,6 +598,7 @@ tools/
 - [Event schema](docs/event-schema.md)
 - [Adversarial analysis](docs/adversarial-analysis.md)
 - [DragonBurn defensive analysis](docs/dragonburn-threat-analysis.md)
+- [Public CS2 cheat defensive analysis](docs/public-cs2-cheat-analysis.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
 - [Engineering project contract](docs/project-board.md)

@@ -34,6 +34,11 @@ typedef struct AcOptions {
     uint64_t integrity_max_file_bytes;
     bool kernel_telemetry;
     bool require_kernel;
+    const wchar_t *manifest_path;
+    const wchar_t *manifest_sha256;
+    bool require_manifest;
+    AcDispatchWatch dispatch_watches[AC_MAX_DISPATCH_WATCHES];
+    size_t dispatch_watch_count;
 } AcOptions;
 
 static DWORD ac_jittered_interval(DWORD interval_ms)
@@ -111,11 +116,16 @@ static void ac_print_usage(const wchar_t *program)
         L"  --repeat-interval-ms <n>  re-report an identical signal after this (default 300000)\n"
         L"  --no-module-hashes        do not SHA-256 unknown module files\n"
         L"  --no-region-probe         do not read suspicious region content\n"
+        L"  --watch-pointer <m+rva>   validate a critical function-pointer slot\n"
+        L"  --watch-vtable <m+rva:n>  validate n entries of an object VMT\n"
         L"\n"
         L"Module integrity:\n"
         L"  --no-module-integrity     do not validate executable sections against disk\n"
         L"  --integrity-budget <n>    bytes hashed per scan (default 16777216)\n"
         L"  --integrity-max-file <n>  largest module file to validate (default 67108864)\n"
+        L"  --manifest <file>         trusted module/driver manifest\n"
+        L"  --manifest-sha256 <hex>   control-plane pin for the manifest file\n"
+        L"  --require-manifest        fail when the pinned manifest is unavailable\n"
         L"\n"
         L"Kernel telemetry:\n"
         L"  --kernel                  consume AcTelemetry driver events when available\n"
@@ -213,6 +223,26 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
             options->skip_region_probe = true;
         } else if (wcscmp(argument, L"--no-module-integrity") == 0) {
             options->skip_module_integrity = true;
+        } else if (wcscmp(argument, L"--watch-pointer") == 0 && has_value) {
+            if (options->dispatch_watch_count >= AC_MAX_DISPATCH_WATCHES ||
+                !ac_dispatch_watch_parse(
+                    argv[++index],
+                    AC_DISPATCH_FUNCTION_POINTER,
+                    &options->dispatch_watches[
+                        options->dispatch_watch_count])) {
+                return false;
+            }
+            ++options->dispatch_watch_count;
+        } else if (wcscmp(argument, L"--watch-vtable") == 0 && has_value) {
+            if (options->dispatch_watch_count >= AC_MAX_DISPATCH_WATCHES ||
+                !ac_dispatch_watch_parse(
+                    argv[++index],
+                    AC_DISPATCH_OBJECT_VTABLE,
+                    &options->dispatch_watches[
+                        options->dispatch_watch_count])) {
+                return false;
+            }
+            ++options->dispatch_watch_count;
         } else if (wcscmp(argument, L"--integrity-budget") == 0 && has_value) {
             if (!ac_parse_u64(argv[++index], 0u, 4096ull * 1024ull * 1024ull, &number)) {
                 return false;
@@ -228,6 +258,12 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         } else if (wcscmp(argument, L"--require-kernel") == 0) {
             options->kernel_telemetry = true;
             options->require_kernel = true;
+        } else if (wcscmp(argument, L"--manifest") == 0 && has_value) {
+            options->manifest_path = argv[++index];
+        } else if (wcscmp(argument, L"--manifest-sha256") == 0 && has_value) {
+            options->manifest_sha256 = argv[++index];
+        } else if (wcscmp(argument, L"--require-manifest") == 0) {
+            options->require_manifest = true;
         } else if (wcscmp(argument, L"--process") == 0 && has_value) {
             options->process_name = argv[++index];
         } else if (wcscmp(argument, L"--log") == 0 && has_value) {
@@ -277,6 +313,11 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         }
     }
 
+    if ((options->manifest_path == NULL) !=
+            (options->manifest_sha256 == NULL) ||
+        (options->require_manifest && options->manifest_path == NULL)) {
+        return false;
+    }
     if (options->pid != 0) {
         return true;
     }
@@ -484,6 +525,7 @@ int wmain(int argc, wchar_t **argv)
     AcKernelClient kernel_client;
     AcThreatSensor threat_sensor;
     AcPolicy policy;
+    AcManifest manifest;
     AcTarget target;
     const wchar_t *roots[AC_MAX_ALLOW_ROOTS];
     wchar_t windows_directory[MAX_PATH];
@@ -505,11 +547,13 @@ int wmain(int argc, wchar_t **argv)
     bool kernel_ready = false;
     bool threat_sensor_ready = false;
     bool kernel_telemetry_complete = true;
+    bool manifest_ready = false;
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
     memset(&threat_sensor, 0, sizeof(threat_sensor));
     ac_kernel_client_init(&kernel_client);
+    ac_manifest_init(&manifest);
 
     if (!ac_parse_options(argc, argv, &options, &exit_now)) {
         ac_print_usage(argv[0]);
@@ -557,6 +601,49 @@ int wmain(int argc, wchar_t **argv)
         sizeof(void *) * 8u);
     ac_log_event(&logger, AC_SEVERITY_INFO, "agent_started", 0, details);
     ac_log_collector_identity(&logger);
+
+    if (options.manifest_path != NULL) {
+        if (!ac_manifest_load_pinned(
+                &manifest,
+                options.manifest_path,
+                options.manifest_sha256)) {
+            ac_log_win32_error_severity(
+                &logger,
+                AC_SEVERITY_HIGH,
+                "trusted_manifest_rejected",
+                0,
+                GetLastError());
+            if (options.require_manifest) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        } else {
+            char manifest_details[256];
+            manifest_ready = true;
+            (void)snprintf(
+                manifest_details,
+                sizeof(manifest_details),
+                "{\"manifest_sha256\":\"%s\",\"entries\":%zu,"
+                "\"trust_source\":\"control_plane_hash_pin\"}",
+                manifest.file_sha256,
+                manifest.count);
+            ac_log_event(
+                &logger,
+                AC_SEVERITY_INFO,
+                "trusted_manifest_loaded",
+                0,
+                manifest_details);
+        }
+    } else {
+        ac_log_event(
+            &logger,
+            AC_SEVERITY_MEDIUM,
+            "trusted_manifest_unavailable",
+            0,
+            "{\"module_authorization\":false,"
+            "\"driver_authorization\":false,"
+            "\"required_action\":\"supply_control_plane_pin\"}");
+    }
 
     if (!ac_resolve_target_pid(&options, &logger, &target.pid)) {
         exit_code = ac_stop_requested() ? AC_EXIT_OK : AC_EXIT_TARGET_NOT_FOUND;
@@ -619,6 +706,14 @@ int wmain(int argc, wchar_t **argv)
     policy.verify_module_integrity = !options.skip_module_integrity;
     policy.integrity_budget_bytes = options.integrity_budget_bytes;
     policy.integrity_max_file_bytes = options.integrity_max_file_bytes;
+    policy.manifest = manifest_ready ? &manifest : NULL;
+    policy.dispatch_watch_count = options.dispatch_watch_count;
+    if (options.dispatch_watch_count > 0) {
+        memcpy(
+            policy.dispatch_watches,
+            options.dispatch_watches,
+            options.dispatch_watch_count * sizeof(options.dispatch_watches[0]));
+    }
 
     if (!ac_context_init(&context, &logger, &policy)) {
         ac_log_event(
@@ -643,6 +738,15 @@ int wmain(int argc, wchar_t **argv)
     } else {
         threat_sensor_ready = true;
         ac_threat_sensor_report_posture(
+            &threat_sensor,
+            &logger,
+            target.pid);
+        ac_threat_sensor_report_driver_snapshot(
+            &threat_sensor,
+            &logger,
+            target.pid,
+            manifest_ready ? &manifest : NULL);
+        ac_threat_sensor_report_input_posture(
             &threat_sensor,
             &logger,
             target.pid);
@@ -805,6 +909,7 @@ int wmain(int argc, wchar_t **argv)
                 &logger,
                 target.pid,
                 scan_id,
+                &context.module_ranges,
                 &threat_stats);
             threat_indicators_observed += threat_stats.indicators_observed;
             threat_overlay_candidates += threat_stats.overlay_candidates;
@@ -1011,6 +1116,7 @@ cleanup:
         CloseHandle(g_stop_event);
         g_stop_event = NULL;
     }
+    ac_manifest_free(&manifest);
     ac_logger_close(&logger);
     return exit_code;
 }

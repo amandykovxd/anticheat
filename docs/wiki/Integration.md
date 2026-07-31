@@ -5,23 +5,28 @@
 1. Build and sign the x64 driver package for the supported Windows release.
 2. Install and start the `AcTelemetry` kernel service.
 3. Start the protected application and retain its PID and creation identity.
-4. Start the collector with:
+4. Obtain the deployment manifest and its SHA-256 pin through the authenticated
+   control-plane channel.
+5. Start the collector with:
 
    ```powershell
    anticheat.exe `
      --pid <pid> `
      --require-kernel `
+     --require-manifest `
+     --manifest <path> `
+     --manifest-sha256 <hex> `
      --interval-ms 5000 `
      --log anticheat-events.jsonl
    ```
 
-5. Start `tools/telemetry_shipper.py` with the JSONL path, HTTPS receiver,
+6. Start `tools/telemetry_shipper.py` with the JSONL path, HTTPS receiver,
    trust store, and deployment token.
-6. Monitor acknowledged batches and the negotiated heartbeat interval.
-7. Verify retained local segments with `tools/verify_log.py`.
-8. Correlate driver, scanner, process-identity, queue-health, and session
+7. Monitor acknowledged batches and the negotiated heartbeat interval.
+8. Verify retained local segments with `tools/verify_log.py`.
+9. Correlate driver, scanner, process-identity, queue-health, and session
    signals on the server.
-9. Stop the shipper and collector before unloading or upgrading the driver.
+10. Stop the shipper and collector before unloading or upgrading the driver.
 
 The wire protocol and operational configuration are documented in
 [Transport integration](../transport-integration.md).

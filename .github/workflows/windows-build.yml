@@ -13,6 +13,51 @@ permissions:
   contents: read
 
 jobs:
+  kernel-driver:
+    name: windows x64 kernel driver
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build WDK driver
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' |
+            Select-Object -First 1
+          if (-not $msbuild) {
+            throw 'MSBuild was not found'
+          }
+          $output = Join-Path $PWD 'out\driver\x64\Release'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          & $msbuild 'driver\AcTelemetry.vcxproj' `
+            /restore /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            "/p:OutDir=$output\"
+          if ($LASTEXITCODE -ne 0) {
+            throw "driver build exited with $LASTEXITCODE"
+          }
+          $driver = Join-Path $output 'AcTelemetry.sys'
+          if (-not (Test-Path $driver)) {
+            throw 'AcTelemetry.sys was not produced'
+          }
+          Copy-Item 'driver\AcTelemetry.inf' $output
+          $digest = (Get-FileHash -Algorithm SHA256 $driver).Hash.ToLowerInvariant()
+          "$digest  AcTelemetry.sys" |
+            Set-Content -Encoding ascii (Join-Path $output 'SHA256SUMS')
+
+      - name: Upload unsigned driver package
+        uses: actions/upload-artifact@v7
+        with:
+          name: AcTelemetry-unsigned-x64
+          path: out/driver/x64/Release
+          if-no-files-found: error
+
   windows:
     name: windows ${{ matrix.arch }}
     runs-on: windows-2022
@@ -46,8 +91,8 @@ jobs:
               Out-String |
               ConvertFrom-Json
           )
-          if ($inventory.tests.Count -ne 44) {
-            throw "Expected 44 independent tests, found $($inventory.tests.Count)"
+          if ($inventory.tests.Count -ne 52) {
+            throw "Expected 52 independent tests, found $($inventory.tests.Count)"
           }
 
       - name: Test
@@ -120,6 +165,11 @@ jobs:
       - name: Test
         run: ctest --preset macos-release
 
+      - name: Verify automated test inventory
+        run: |
+          count=$(ctest --preset macos-release -N | sed -n 's/^Total Tests: //p')
+          test "$count" = 23
+
       - name: Install
         run: cmake --install out/build/macos --prefix out/install/macos
 
@@ -146,6 +196,45 @@ jobs:
         with:
           name: anticheat-macos
           path: out/install/macos
+          if-no-files-found: error
+
+  linux:
+    name: linux user-mode collector
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -S . -B out/build/linux -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build out/build/linux --parallel
+
+      - name: Verify automated test inventory
+        run: |
+          count=$(ctest --test-dir out/build/linux -N | sed -n 's/^Total Tests: //p')
+          test "$count" = 22
+
+      - name: Test
+        run: ctest --test-dir out/build/linux --output-on-failure
+
+      - name: Install and stage release artifact
+        run: |
+          cmake --install out/build/linux --prefix out/install/linux
+          out/install/linux/bin/anticheat \
+            --self --once --quiet --log linux-smoke.jsonl
+          python3 tools/verify_log.py linux-smoke.jsonl
+          sha256sum out/install/linux/bin/anticheat \
+            | sed 's#out/install/linux/bin/##' \
+            > out/install/linux/SHA256SUMS
+          cp linux-smoke.jsonl out/install/linux/smoke.jsonl
+
+      - name: Upload collector package
+        uses: actions/upload-artifact@v7
+        with:
+          name: anticheat-linux-x64
+          path: out/install/linux
           if-no-files-found: error
 
   portable-core:
