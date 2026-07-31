@@ -22,6 +22,7 @@ enforcement.
 - [Security operations](wiki/Security-Operations.html)
 - [Contribution workflow](wiki/Contribution-Workflow.html)
 - [Driver ABI and lifecycle](driver-integration.html)
+- [Authenticated transport and remote anchoring](transport-integration.html)
 - [Event schema](event-schema.html)
 - [Adversarial analysis](adversarial-analysis.html)
 - [Engineering project contract](project-board.html)

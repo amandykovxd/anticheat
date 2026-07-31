@@ -46,8 +46,8 @@ jobs:
               Out-String |
               ConvertFrom-Json
           )
-          if ($inventory.tests.Count -ne 36) {
-            throw "Expected 36 independent tests, found $($inventory.tests.Count)"
+          if ($inventory.tests.Count -ne 37) {
+            throw "Expected 37 independent tests, found $($inventory.tests.Count)"
           }
 
       - name: Test

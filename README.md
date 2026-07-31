@@ -10,6 +10,8 @@ Anticheat Telemetry is a Windows process-integrity sensor composed of:
 
 - `AcTelemetry.sys`: optional x64 kernel telemetry driver;
 - `anticheat.exe`: user-mode collector and process-memory scanner;
+- `tools/telemetry_shipper.py`: bounded asynchronous delivery sidecar;
+- `tools/reference_receiver.py`: authenticated remote anchor receiver;
 - `tools/verify_log.py`: JSONL integrity-chain verifier;
 - a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
@@ -44,7 +46,14 @@ anticheat.exe
 tamper-evident JSONL
                |
                v
-integrator-owned storage, transport, correlation, and policy
+telemetry_shipper.py bounded SQLite spool
+               |
+       authenticated TLS batches
+               v
+reference_receiver.py remote anchors
+               |
+               v
+integrator-owned correlation and policy
 ```
 
 The driver and collector use the shared ABI defined in
@@ -60,7 +69,8 @@ registration to a cryptographically random collector session identifier.
 | User-mode collector | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
 | macOS user-mode collector | Apple Silicon, Intel | Xcode Command Line Tools and CMake 3.24+ |
 | Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
-| Log verifier | Platform-independent | Python 3 |
+| Transport sidecar and reference receiver | Linux, macOS, Windows | Python 3.10+ |
+| Log verifier | Platform-independent | Python 3.10+ |
 
 Use the x64 collector for x64 targets. A Win32 collector cannot enumerate all
 modules of an x64 process.
@@ -112,12 +122,13 @@ core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer
 
 ### Automated test inventory
 
-Windows builds register 36 independent CTest cases: 17 portable algorithms,
-16 Windows collector/core behaviors, and 3 CLI contracts. macOS builds register
-21 cases: the 17 portable cases, 3 CLI contracts, and one live self-scan.
-Linux sanitizer builds register the 17 portable cases. Each entry runs one
-unique test function or contract so a failure identifies the affected subsystem
-directly.
+Windows builds register 37 independent CTest cases: 17 portable algorithms,
+16 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
+macOS builds register 22 cases: 17 portable cases, 3 CLI contracts, one live
+self-scan, and the transport suite. Linux sanitizer builds register 18 cases:
+17 portable cases and the transport suite. The transport CTest entry contains
+21 protocol, persistence, tamper, authentication, rotation, and backpressure
+tests.
 
 List the registered cases without executing them:
 
@@ -132,9 +143,9 @@ ctest --preset windows-x64-release -L portable
 ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 ```
 
-The available labels are `portable`, `core`, `cli`, and `windows`.
-The Windows CI matrix rejects a configuration that does not expose exactly 24
-independent cases.
+The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
+`transport`, and `integration`. The Windows CI matrix rejects a configuration
+that does not expose exactly 37 independent CTest entries.
 
 ## Build and run on macOS
 
@@ -263,14 +274,22 @@ privileges when the target process ACL permits read access.
 2. Install and start the `AcTelemetry` driver service during product setup.
 3. Start the protected application and retain its PID and process handle.
 4. Start `anticheat.exe --pid <pid> --require-kernel`.
-5. Read the JSONL file or forward complete lines to the integrator's collector.
-6. Validate each log segment with `tools/verify_log.py`.
-7. Enforce schema compatibility using `details.schema` from
+5. Start `tools/telemetry_shipper.py` against the JSONL path and an
+   authenticated HTTPS receiver.
+6. Confirm server session registration, batch acknowledgements, and heartbeat
+   cadence.
+7. Validate retained local segments with `tools/verify_log.py`.
+8. Enforce schema compatibility using `details.schema` from
    `log_segment_opened` and `agent_started`.
-8. Correlate signals on the server. Do not treat a single client event as an
+9. Correlate signals on the server. Do not treat a single client event as an
    enforcement decision.
-9. Monitor expected `scan_completed` cadence and kernel queue-overflow events.
-10. Stop the collector before unloading or upgrading the driver.
+10. Monitor expected heartbeat, `scan_completed` cadence, and kernel
+    queue-overflow events.
+11. Stop the shipper and collector before unloading or upgrading the driver.
+
+The complete transport deployment, TLS, spool, protocol, and failure-handling
+contract is defined in
+[docs/transport-integration.md](docs/transport-integration.md).
 
 For launchers that must capture the earliest possible post-launch image loads,
 create the application suspended, obtain its PID, start the collector with
@@ -428,13 +447,18 @@ src/
 tests/
   test_core.c             Windows integration and ABI tests
   test_portable.c         portable unit tests
+  test_transport.py       remote anchoring and spool tests
 tools/
+  telemetry_shipper.py    bounded asynchronous delivery sidecar
+  reference_receiver.py  authenticated anchor receiver
+  transport_common.py     shared protocol and chain validation
   verify_log.py           log-chain verifier
 ```
 
 ## Additional documentation
 
 - [Driver integration](docs/driver-integration.md)
+- [Transport integration](docs/transport-integration.md)
 - [Event schema](docs/event-schema.md)
 - [Adversarial analysis](docs/adversarial-analysis.md)
 - [Security model](SECURITY.md)

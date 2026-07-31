@@ -15,11 +15,16 @@
      --log anticheat-events.jsonl
    ```
 
-5. Forward complete JSONL records without reserialization.
-6. Verify retained segments with `tools/verify_log.py`.
-7. Correlate driver, scanner, process-identity, queue-health, and session
+5. Start `tools/telemetry_shipper.py` with the JSONL path, HTTPS receiver,
+   trust store, and deployment token.
+6. Monitor acknowledged batches and the negotiated heartbeat interval.
+7. Verify retained local segments with `tools/verify_log.py`.
+8. Correlate driver, scanner, process-identity, queue-health, and session
    signals on the server.
-8. Stop the collector before unloading or upgrading the driver.
+9. Stop the shipper and collector before unloading or upgrading the driver.
+
+The wire protocol and operational configuration are documented in
+[Transport integration](../transport-integration.md).
 
 ## Earliest-event capture
 

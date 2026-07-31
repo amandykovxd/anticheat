@@ -7,11 +7,13 @@ This repository contains:
 - an optional Windows kernel telemetry driver;
 - a user-mode process scanner and event collector;
 - a local tamper-evident JSONL logger;
+- an asynchronous authenticated transport sidecar;
+- a reference remote anchor receiver;
 - a log-chain verification utility.
 
 The system produces telemetry for an explicitly registered target process.
-Enforcement, account actions, network transport, and server-side correlation
-are outside the repository.
+Enforcement, account actions, production identity provisioning, and
+server-side correlation are outside the repository.
 
 ## Trust boundaries
 
@@ -32,8 +34,9 @@ User boundary
            v
 Integrator boundary
   file ownership
-  transport
-  remote storage
+  telemetry_shipper.py
+  authenticated TLS transport
+  reference_receiver.py anchors
   correlation and policy
 ```
 
@@ -196,10 +199,11 @@ reordering within retained segments. It does not prevent:
 - generation of a new internally consistent log by a local administrator;
 - rollback to an earlier complete segment set.
 
-For remote evidence retention, forward the current chain head and sequence
-number to append-only remote storage during the session. The transport must
-authenticate the endpoint and associate records with a server-issued session
-identifier.
+`tools/telemetry_shipper.py` forwards exact record bytes through authenticated
+TLS batches. `tools/reference_receiver.py` independently verifies each chain
+transition and persists the accepted chain head under a server-issued session
+identifier. Production deployments must protect receiver storage against
+operator rollback and monitor missing heartbeat intervals.
 
 ## Driver signing and deployment
 

@@ -58,7 +58,38 @@ if(BUILD_TESTING)
             PROPERTIES LABELS "portable" TIMEOUT 30
         )
     endforeach()
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME transport.remote_anchoring
+            COMMAND
+                ${Python3_EXECUTABLE}
+                -m unittest -v tests/test_transport.py
+        )
+        set_tests_properties(
+            transport.remote_anchoring
+            PROPERTIES
+                LABELS "transport;integration"
+                TIMEOUT 60
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+        )
+    endif()
 endif()
+
+install(
+    PROGRAMS
+        tools/reference_receiver.py
+        tools/telemetry_shipper.py
+        tools/transport_common.py
+        tools/verify_log.py
+    DESTINATION tools
+)
+install(
+    FILES docs/transport-integration.md
+    DESTINATION docs
+)
 
 if(APPLE)
     add_executable(anticheat src/macos_main.c)
