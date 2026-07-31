@@ -2,12 +2,13 @@
 
 ## Toolchain
 
-Use Visual Studio 2022 with Desktop C++ support. The project pins the x64 WDK
-NuGet package so CI and local builds restore the same WDK/SDK dependency set.
+Use Visual Studio 2022 with Desktop C++ support. `driver\packages.config` pins
+the x64 WDK and SDK packages so CI and local builds restore the same dependency
+set; `driver\Directory.Build.props` imports them into the project.
 
 ```powershell
+nuget restore driver\packages.config -PackagesDirectory driver\packages
 msbuild driver\AcTelemetry.vcxproj `
-  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```

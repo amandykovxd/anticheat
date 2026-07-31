@@ -16,4 +16,6 @@
 /driver/x64/
 /driver/Debug/
 /driver/Release/
+/driver/obj/
+/driver/packages/
 /CMakeUserPresets.json

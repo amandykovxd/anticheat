@@ -413,8 +413,8 @@ An integrator may apply a stricter policy outside the collector.
 Build:
 
 ```powershell
+nuget restore driver\packages.config -PackagesDirectory driver\packages
 msbuild driver\AcTelemetry.vcxproj `
-  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```

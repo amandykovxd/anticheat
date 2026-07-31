@@ -20,6 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Restore WDK NuGet packages
+        shell: pwsh
+        run: |
+          nuget restore driver\packages.config -PackagesDirectory driver\packages
+          if ($LASTEXITCODE -ne 0) {
+            throw "nuget restore exited with $LASTEXITCODE"
+          }
+
       - name: Build WDK driver
         shell: pwsh
         run: |
@@ -35,7 +43,7 @@ jobs:
           $output = Join-Path $PWD 'out\driver\x64\Release'
           New-Item -ItemType Directory -Force $output | Out-Null
           & $msbuild 'driver\AcTelemetry.vcxproj' `
-            /restore /m `
+            /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
             "/p:OutDir=$output\"

@@ -56,8 +56,9 @@
   <ItemGroup>
     <ClInclude Include="..\include\ac_driver_protocol.h" />
   </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.WDK.x64" Version="10.0.26100.6584" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="VerifyWdkNuGetRestore" BeforeTargets="ClCompile">
+    <Error Condition="'$(WDK_NuGet)' != 'true'"
+           Text="The WDK NuGet packages are not restored. Run: nuget restore driver\packages.config -PackagesDirectory driver\packages" />
+  </Target>
 </Project>

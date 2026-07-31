@@ -250,15 +250,17 @@ not as evidence that cross-process memory access did not occur.
 
 ## Build the kernel driver
 
-Install Visual Studio 2022 with Desktop C++ support. The project pins
-`Microsoft.Windows.WDK.x64` `10.0.26100.6584`; package restore supplies the
-matching WDK and SDK build inputs used by CI.
+Install Visual Studio 2022 with Desktop C++ support. `driver\packages.config`
+pins the WDK and SDK packages at `10.0.26100.6584`; `driver\Directory.Build.props`
+imports them, so a restored package set — not a locally installed kit — supplies
+the build inputs used by CI. The build fails with an explicit error when the
+packages are missing.
 
 From a Developer Command Prompt:
 
 ```powershell
+nuget restore driver\packages.config -PackagesDirectory driver\packages
 msbuild driver\AcTelemetry.vcxproj `
-  /restore `
   /p:Configuration=Release `
   /p:Platform=x64
 ```
@@ -564,6 +566,8 @@ include/
 driver/
   AcTelemetry.vcxproj     WDK x64 driver project
   AcTelemetry.inf         driver package metadata
+  packages.config         pinned WDK and SDK package versions
+  Directory.Build.props   imports the restored WDK and SDK packages
   src/driver.c            callbacks, device, IOCTLs, bounded queue
 src/
   kernel_client.c         user-mode driver client
