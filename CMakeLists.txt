@@ -73,7 +73,8 @@ if(BUILD_TESTING)
                 LABELS "transport;integration"
                 TIMEOUT 60
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-                ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+                ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1;PYTHONWARNINGS=error::ResourceWarning"
         )
     endif()
 endif()

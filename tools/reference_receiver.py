@@ -42,6 +42,16 @@ BATCH_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/batches$")
 HEARTBEAT_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/heartbeat$")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commit or roll back a context, then release its OS file handle."""
+
+    def __exit__(self, *arguments: Any) -> bool | None:
+        try:
+            return super().__exit__(*arguments)
+        finally:
+            self.close()
+
+
 class ReceiverError(RuntimeError):
     def __init__(
         self,
@@ -70,7 +80,11 @@ class ReceiverStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, timeout=10.0)
+        connection = sqlite3.connect(
+            self.database,
+            timeout=10.0,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")

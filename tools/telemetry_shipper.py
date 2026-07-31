@@ -60,6 +60,16 @@ class RemoteRejectedError(ShipperError):
         super().__init__(f"receiver rejected request with HTTP {status}: {response}")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commit or roll back a context, then release its OS file handle."""
+
+    def __exit__(self, *arguments: Any) -> bool | None:
+        try:
+            return super().__exit__(*arguments)
+        finally:
+            self.close()
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -91,7 +101,11 @@ class TransportSpool:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, timeout=10.0)
+        connection = sqlite3.connect(
+            self.database,
+            timeout=10.0,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -676,9 +690,12 @@ class ReceiverClient:
                 value = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             try:
-                value = json.loads(error.read().decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                value = {"error": {"code": "invalid_error_response"}}
+                try:
+                    value = json.loads(error.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    value = {"error": {"code": "invalid_error_response"}}
+            finally:
+                error.close()
             if 400 <= error.code < 500:
                 raise RemoteRejectedError(error.code, value) from error
             raise OSError(f"receiver returned HTTP {error.code}") from error
