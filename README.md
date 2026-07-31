@@ -124,8 +124,9 @@ core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer
 
 Windows builds register 37 independent CTest cases: 17 portable algorithms,
 16 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
-macOS builds register 22 cases: 17 portable cases, 3 CLI contracts, one live
-self-scan, and the transport suite. Linux sanitizer builds register 18 cases:
+macOS builds register 23 cases: 17 portable cases, 3 CLI contracts, one live
+self-scan, one suspicious-region integration test, and the transport suite.
+Linux sanitizer builds register 18 cases:
 17 portable cases and the transport suite. The transport CTest entry contains
 21 protocol, persistence, tamper, authentication, rotation, and backpressure
 tests.
@@ -181,6 +182,36 @@ and starts a self-scan with valid arguments. Select
 `macOS: collector self-scan (LLDB DAP)` in Run and Debug. Do not configure
 Apple `lldb` as a `cppdbg` MI executable: current Apple LLDB does not implement
 the removed `--interpreter=mi` interface.
+
+### Reproduce suspicious executable-region telemetry
+
+The repository includes a harmless macOS fixture that allocates one anonymous
+`R-X` page, keeps it mapped, and never transfers execution to it. Run the
+fixture in the first terminal:
+
+```bash
+python3 tools/macos_suspicious_fixture.py --mode rx --duration 300
+```
+
+Copy the reported `pid`, then scan that process from a second terminal:
+
+```bash
+./out/build/macos-debug/anticheat \
+  --pid <fixture-pid> \
+  --once \
+  --quiet \
+  --log suspicious-events.jsonl
+python3 tools/verify_log.py suspicious-events.jsonl
+jq -c 'select(.event == "executable_region_anomaly" or .event == "scan_completed")' \
+  suspicious-events.jsonl
+```
+
+Expected telemetry includes a medium-severity `executable_region_anomaly`
+with `anonymous:true`, followed by a complete scan summary with
+`anonymous_executable` and `emitted` greater than zero. The fixture is also
+executed by CTest as `macos.suspicious_executable_region`.
+
+![macOS anonymous executable-region detection log](docs/assets/macos-suspicious-detection.svg)
 
 macOS does not use the Windows WDK driver or its IOCTL transport. System
 Integrity Protection, process ownership, and platform privacy controls may

@@ -128,9 +128,25 @@ if(APPLE)
             macos.live_self_scan
             PROPERTIES LABELS "macos;integration" TIMEOUT 30
         )
+
+        if(Python3_Interpreter_FOUND)
+            add_test(
+                NAME macos.suspicious_executable_region
+                COMMAND
+                    ${Python3_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_macos_suspicious_fixture.py"
+                    --collector $<TARGET_FILE:anticheat>
+                    --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tools/macos_suspicious_fixture.py"
+            )
+            set_tests_properties(
+                macos.suspicious_executable_region
+                PROPERTIES LABELS "macos;integration" TIMEOUT 30
+            )
+        endif()
     endif()
 
     install(TARGETS anticheat RUNTIME DESTINATION bin)
+    install(PROGRAMS tools/macos_suspicious_fixture.py DESTINATION tools)
     return()
 endif()
 

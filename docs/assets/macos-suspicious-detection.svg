@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="690" viewBox="0 0 1440 690" role="img" aria-labelledby="title description">
+  <title id="title">macOS suspicious executable-region detection log</title>
+  <desc id="description">Terminal output showing an anonymous executable mapping, its detection by the collector, a completed scan, and successful log-chain verification.</desc>
+  <rect width="1440" height="690" rx="18" fill="#0d1117"/>
+  <rect width="1440" height="52" rx="18" fill="#161b22"/>
+  <rect y="34" width="1440" height="18" fill="#161b22"/>
+  <circle cx="28" cy="26" r="7" fill="#ff5f57"/>
+  <circle cx="52" cy="26" r="7" fill="#febc2e"/>
+  <circle cx="76" cy="26" r="7" fill="#28c840"/>
+  <text x="720" y="32" text-anchor="middle" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15">anticheat — macOS detection</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">
+    <text x="28" y="88" fill="#7ee787">$ python3 tools/macos_suspicious_fixture.py --mode rx --duration 300</text>
+    <text x="28" y="120" fill="#c9d1d9">{"fixture":"anonymous_executable_region","pid":17850,</text>
+    <text x="28" y="146" fill="#c9d1d9"> "address":"0x104428000","size":16384,"mode":"rx","payload_executed":false}</text>
+
+    <text x="28" y="188" fill="#7ee787">$ ./out/build/macos-debug/anticheat --pid 17850 \</text>
+    <text x="28" y="216" fill="#7ee787">    --once --quiet --log suspicious-events.jsonl</text>
+    <text x="28" y="258" fill="#58a6ff">executable_region_anomaly</text>
+    <text x="322" y="258" fill="#d2a8ff">severity=medium</text>
+    <text x="514" y="258" fill="#c9d1d9">pid=17850</text>
+    <text x="28" y="286" fill="#c9d1d9">scan_id=1  address=0x0000000104428000  size=16384  protection=5 (R-X)</text>
+    <text x="28" y="314" fill="#ffa657">anonymous=true</text>
+    <text x="190" y="314" fill="#c9d1d9">writable=false  path=""</text>
+
+    <text x="28" y="346" fill="#58a6ff">scan_completed</text>
+    <text x="220" y="346" fill="#c9d1d9">scan_id=1  regions=112  executable=13</text>
+    <text x="28" y="374" fill="#ffa657">anonymous_executable=1</text>
+    <text x="286" y="374" fill="#c9d1d9">writable_executable=0  emitted=1  complete=true</text>
+
+    <text x="28" y="430" fill="#7ee787">$ python3 tools/verify_log.py suspicious-events.jsonl</text>
+    <text x="28" y="466" fill="#c9d1d9">lines:     6</text>
+    <text x="28" y="494" fill="#c9d1d9">segments:  1</text>
+    <text x="28" y="522" fill="#c9d1d9">events:    executable_region_anomaly=1  scan_completed=1</text>
+    <text x="28" y="550" fill="#c9d1d9">severity:  medium=1  info=5</text>
+    <text x="28" y="590" fill="#7ee787">integrity: OK</text>
+
+    <text x="28" y="646" fill="#8b949e">Safe fixture: mapping retained; payload never executed.</text>
+  </g>
+</svg>
