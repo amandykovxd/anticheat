@@ -491,11 +491,17 @@ static void ac_linux_scan_foreign_fds(
                 strcmp(destination, "/dev/input/uinput") == 0) {
                 char details[512];
                 const bool target_memory = strcmp(destination, target_mem) == 0;
+                /*
+                 * The comparisons above pin destination to one of three known
+                 * paths, none longer than target_mem and none carrying a
+                 * character JSON has to escape, so the explicit precision only
+                 * states the bound the compiler cannot infer from readlink.
+                 */
                 (void)snprintf(
                     details,
                     sizeof(details),
                     "{\"scan_id\":%" PRIu64
-                    ",\"owner_pid\":%ld,\"fd\":%s,\"destination\":\"%s\","
+                    ",\"owner_pid\":%ld,\"fd\":%s,\"destination\":\"%.63s\","
                     "\"reason\":\"%s\",\"verdict\":\"signal_only\"}",
                     scan_id,
                     (long)owner_pid,
