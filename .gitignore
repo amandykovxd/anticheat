@@ -1,7 +1,10 @@
 /build/
 /out/
 /.vs/
-/.vscode/
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/launch.json
+!/.vscode/tasks.json
 *.jsonl
 *.exe
 *.obj

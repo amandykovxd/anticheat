@@ -49,6 +49,21 @@
         "BUILD_TESTING": "ON",
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "macOS user-mode collector (Debug)",
+      "description": "Configure a native macOS collector with debug symbols for LLDB DAP.",
+      "binaryDir": "${sourceDir}/out/build/macos-debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     }
   ],
   "buildPresets": [
@@ -68,6 +83,11 @@
       "name": "macos-release",
       "displayName": "Build macOS Release",
       "configurePreset": "macos"
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "Build macOS Debug",
+      "configurePreset": "macos-debug"
     }
   ],
   "testPresets": [
@@ -99,6 +119,17 @@
       "name": "macos-release",
       "displayName": "Test macOS Release",
       "configurePreset": "macos",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "Test macOS Debug",
+      "configurePreset": "macos-debug",
       "output": {
         "outputOnFailure": true
       },

@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "macOS: collector self-scan (LLDB DAP)",
+      "type": "lldb-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/macos-debug/anticheat",
+      "args": [
+        "--self",
+        "--once",
+        "--log",
+        "${workspaceFolder}/anticheat-debug.jsonl"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build macOS Debug"
+    }
+  ]
+}

@@ -167,6 +167,21 @@ Target selection by process name is also supported:
 ./out/install/macos/bin/anticheat --process game --interval-ms 5000
 ```
 
+For an LLDB build with debug symbols:
+
+```bash
+cmake --preset macos-debug
+cmake --build --preset macos-debug
+ctest --preset macos-debug
+./out/build/macos-debug/anticheat --self --once
+```
+
+The checked-in VS Code launch profile uses the official `lldb-dap` extension
+and starts a self-scan with valid arguments. Select
+`macOS: collector self-scan (LLDB DAP)` in Run and Debug. Do not configure
+Apple `lldb` as a `cppdbg` MI executable: current Apple LLDB does not implement
+the removed `--interpreter=mi` interface.
+
 macOS does not use the Windows WDK driver or its IOCTL transport. System
 Integrity Protection, process ownership, and platform privacy controls may
 limit metadata visibility for unrelated processes. See
