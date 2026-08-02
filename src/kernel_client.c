@@ -608,7 +608,7 @@ bool ac_kernel_client_process_stats(
                 "{\"callbacks_active\":%u,\"expected_mask\":%u,"
                 "\"telemetry_complete\":false}",
                 stats->callbacks_active,
-                AC_DRIVER_CALLBACK_REQUIRED);
+                (unsigned int)AC_DRIVER_CALLBACK_REQUIRED);
             ac_log_event(
                 logger,
                 AC_SEVERITY_HIGH,

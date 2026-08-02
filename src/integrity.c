@@ -188,8 +188,10 @@ static void ac_integrity_baseline_release(AcIntegrityBaseline *baseline)
         return;
     }
 
-    for (index = 0; index < baseline->section_count; ++index) {
-        free(baseline->sections[index].block_hashes);
+    if (baseline->sections != NULL) {
+        for (index = 0; index < baseline->section_count; ++index) {
+            free(baseline->sections[index].block_hashes);
+        }
     }
     free(baseline->sections);
     free(baseline->export_rvas);

@@ -210,12 +210,21 @@ static void ac_logger_emit_locked(
     SYSTEMTIME timestamp;
     AcSha256 hash;
     char escaped_event[256];
-    char body[AC_LOG_BODY_CAPACITY];
-    char line[AC_LOG_LINE_CAPACITY];
+    char *storage;
+    char *body;
+    char *line;
     char chain_hex[AC_SHA256_HEX_SIZE];
     const char *details = details_json != NULL ? details_json : "{}";
     int body_length;
     int line_length;
+
+    storage = (char *)malloc(AC_LOG_BODY_CAPACITY + AC_LOG_LINE_CAPACITY);
+    if (storage == NULL) {
+        ++logger->write_failures;
+        return;
+    }
+    body = storage;
+    line = storage + AC_LOG_BODY_CAPACITY;
 
     if (logger->max_bytes > 0 && !logger->rotating &&
         logger->bytes_written >= logger->max_bytes) {
@@ -240,7 +249,7 @@ static void ac_logger_emit_locked(
     ++logger->sequence;
     body_length = snprintf(
         body,
-        sizeof(body),
+        AC_LOG_BODY_CAPACITY,
         "{\"seq\":%" PRIu64 ",\"timestamp\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\","
         "\"severity\":\"%s\",\"event\":\"%s\",\"pid\":%lu,\"details\":%s",
         logger->sequence,
@@ -256,11 +265,11 @@ static void ac_logger_emit_locked(
         (unsigned long)pid,
         details);
 
-    if (body_length < 0 || (size_t)body_length >= sizeof(body)) {
+    if (body_length < 0 || (size_t)body_length >= AC_LOG_BODY_CAPACITY) {
         ++logger->truncated_lines;
         body_length = snprintf(
             body,
-            sizeof(body),
+            AC_LOG_BODY_CAPACITY,
             "{\"seq\":%" PRIu64 ",\"timestamp\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\","
             "\"severity\":\"%s\",\"event\":\"%s\",\"pid\":%lu,"
             "\"details\":{\"dropped\":true,\"reason\":\"details_too_large\"}",
@@ -275,8 +284,9 @@ static void ac_logger_emit_locked(
             ac_severity_name(severity),
             escaped_event,
             (unsigned long)pid);
-        if (body_length < 0 || (size_t)body_length >= sizeof(body)) {
+        if (body_length < 0 || (size_t)body_length >= AC_LOG_BODY_CAPACITY) {
             ++logger->write_failures;
+            free(storage);
             return;
         }
     }
@@ -289,16 +299,18 @@ static void ac_logger_emit_locked(
 
     line_length = snprintf(
         line,
-        sizeof(line),
+        AC_LOG_LINE_CAPACITY,
         "%s,\"chain\":\"%s\"}",
         body,
         chain_hex);
-    if (line_length < 0 || (size_t)line_length >= sizeof(line)) {
+    if (line_length < 0 || (size_t)line_length >= AC_LOG_LINE_CAPACITY) {
         ++logger->write_failures;
+        free(storage);
         return;
     }
 
     (void)ac_logger_write_raw_locked(logger, line, (size_t)line_length);
+    free(storage);
 }
 
 bool ac_logger_open(

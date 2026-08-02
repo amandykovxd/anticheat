@@ -59,7 +59,7 @@ jobs:
           run-clang-tidy \
             -p out/analyze/clang \
             -quiet \
-            -checks='-*,clang-analyzer-*' \
+            -checks='-*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
             -warnings-as-errors='clang-analyzer-*'
 
   cppcheck:

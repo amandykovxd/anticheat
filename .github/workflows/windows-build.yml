@@ -48,6 +48,7 @@ jobs:
             /p:Platform=x64 `
             /p:DebugSymbols=true `
             /p:DebugType=full `
+            /p:SignMode=Off `
             "/p:OutDir=$output\"
           if ($LASTEXITCODE -ne 0) {
             throw "driver build exited with $LASTEXITCODE"

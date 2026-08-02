@@ -74,7 +74,7 @@ static bool ac_manifest_hash_stream(
     uint64_t *size_out)
 {
     AcSha256 hash;
-    uint8_t buffer[16384];
+    uint8_t buffer[4096];
     uint64_t size = 0;
 
     ac_sha256_init(&hash);
