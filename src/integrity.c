@@ -187,6 +187,12 @@ static void ac_integrity_sections_release(
     size_t index;
 
     for (index = 0; index < section_count; ++index) {
+        /* The section array is zero-initialized, and section_count advances
+           only after block_hashes is assigned. MSVC does not propagate that
+           invariant through the cache release path. */
+#if defined(_MSC_VER)
+#pragma warning(suppress : 6001)
+#endif
         free(sections[index].block_hashes);
     }
 }

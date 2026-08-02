@@ -234,6 +234,7 @@ bool ac_manifest_load_pinned(
         goto fail;
     }
 
+    memset(line, 0, sizeof(line));
     while (fgets(line, (int)sizeof(line), file) != NULL) {
         char *context = NULL;
         char *kind_text;
