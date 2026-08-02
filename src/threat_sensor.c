@@ -20,6 +20,10 @@
 #define AC_NATIVE_DEVICE_BUFFER_SIZE 65536u
 #define AC_DRIVER_SNAPSHOT_INITIAL 256u
 #define AC_DRIVER_SNAPSHOT_MAX 4096u
+#define AC_DRIVER_PATH_WIDE_CAPACITY 1024u
+#define AC_DRIVER_PATH_UTF8_CAPACITY 3072u
+#define AC_DRIVER_PATH_ESCAPED_CAPACITY 6144u
+#define AC_DRIVER_DETAILS_CAPACITY 6656u
 #define AC_STATUS_NO_MORE_ENTRIES ((LONG)0x8000001aL)
 #define AC_SYSTEM_CODE_INTEGRITY_INFORMATION 103u
 #define AC_CI_OPTION_ENABLED 0x00000001u
@@ -58,6 +62,14 @@ typedef struct AcOverlaySearch {
     uint64_t scan_id;
     AcThreatScanStats *stats;
 } AcOverlaySearch;
+
+typedef struct AcDriverSnapshotBuffers {
+    wchar_t kernel_path[AC_DRIVER_PATH_WIDE_CAPACITY];
+    wchar_t file_path[AC_DRIVER_PATH_WIDE_CAPACITY];
+    char path_utf8[AC_DRIVER_PATH_UTF8_CAPACITY];
+    char escaped_path[AC_DRIVER_PATH_ESCAPED_CAPACITY];
+    char details[AC_DRIVER_DETAILS_CAPACITY];
+} AcDriverSnapshotBuffers;
 
 static const char *ac_configured_state_name(AcConfiguredState state)
 {
@@ -407,6 +419,7 @@ void ac_threat_sensor_report_driver_snapshot(
     size_t paths_available = 0;
     size_t hashes_available = 0;
     bool complete = false;
+    AcDriverSnapshotBuffers *buffers;
     DWORD index;
 
     if (sensor == NULL || logger == NULL ||
@@ -414,6 +427,11 @@ void ac_threat_sensor_report_driver_snapshot(
         return;
     }
     sensor->driver_snapshot_reported = true;
+
+    buffers = (AcDriverSnapshotBuffers *)calloc(1u, sizeof(*buffers));
+    if (buffers == NULL) {
+        return;
+    }
 
     while (capacity <= AC_DRIVER_SNAPSHOT_MAX) {
         LPVOID *candidate = (LPVOID *)realloc(
@@ -438,60 +456,55 @@ void ac_threat_sensor_report_driver_snapshot(
     }
 
     for (index = 0; index < (DWORD)driver_count; ++index) {
-        wchar_t kernel_path[1024];
-        wchar_t file_path[1024];
-        char path_utf8[3072];
-        char escaped_path[6144];
         char digest[AC_SHA256_HEX_SIZE];
-        char details[6656];
         uint64_t file_size = 0;
         bool hash_available = false;
         const DWORD path_length = GetDeviceDriverFileNameW(
             drivers[index],
-            kernel_path,
-            (DWORD)(sizeof(kernel_path) / sizeof(kernel_path[0])));
+            buffers->kernel_path,
+            AC_DRIVER_PATH_WIDE_CAPACITY);
 
         if (path_length == 0 || path_length >=
-            (DWORD)(sizeof(kernel_path) / sizeof(kernel_path[0]))) {
+            AC_DRIVER_PATH_WIDE_CAPACITY) {
             continue;
         }
         ++paths_available;
         if (!ac_normalize_driver_path(
-                kernel_path,
-                file_path,
-                sizeof(file_path) / sizeof(file_path[0]))) {
+                buffers->kernel_path,
+                buffers->file_path,
+                AC_DRIVER_PATH_WIDE_CAPACITY)) {
             (void)wcscpy_s(
-                file_path,
-                sizeof(file_path) / sizeof(file_path[0]),
-                kernel_path);
+                buffers->file_path,
+                AC_DRIVER_PATH_WIDE_CAPACITY,
+                buffers->kernel_path);
         }
-        hash_available = ac_hash_file(file_path, digest, &file_size);
+        hash_available = ac_hash_file(buffers->file_path, digest, &file_size);
         if (hash_available) {
             ++hashes_available;
         }
         if (!ac_wide_to_utf8(
-                file_path,
-                path_utf8,
-                sizeof(path_utf8))) {
+                buffers->file_path,
+                buffers->path_utf8,
+                AC_DRIVER_PATH_UTF8_CAPACITY)) {
             (void)strcpy_s(
-                path_utf8,
-                sizeof(path_utf8),
+                buffers->path_utf8,
+                AC_DRIVER_PATH_UTF8_CAPACITY,
                 "<conversion-failed>");
         }
         (void)ac_json_escape(
-            path_utf8,
-            escaped_path,
-            sizeof(escaped_path));
+            buffers->path_utf8,
+            buffers->escaped_path,
+            AC_DRIVER_PATH_ESCAPED_CAPACITY);
         (void)snprintf(
-            details,
-            sizeof(details),
+            buffers->details,
+            AC_DRIVER_DETAILS_CAPACITY,
             "{\"image_base\":\"0x%" PRIxPTR
             "\",\"path\":\"%s\",\"file_sha256\":%s%s%s,"
             "\"file_size\":%" PRIu64
             ",\"source\":\"psapi_startup_snapshot\","
             "\"verdict\":\"manifest_input\"}",
             (uintptr_t)drivers[index],
-            escaped_path,
+            buffers->escaped_path,
             hash_available ? "\"" : "null",
             hash_available ? digest : "",
             hash_available ? "\"" : "",
@@ -501,26 +514,26 @@ void ac_threat_sensor_report_driver_snapshot(
             AC_SEVERITY_INFO,
             "loaded_kernel_driver_observed",
             target_pid,
-            details);
+            buffers->details);
 
         if (manifest != NULL && manifest->trusted) {
             const AcManifestMatch match = hash_available
                 ? ac_manifest_match_hex(
                     manifest,
                     AC_MANIFEST_DRIVER,
-                    file_path,
+                    buffers->file_path,
                     digest)
                 : AC_MANIFEST_HASH_MISMATCH;
             if (match != AC_MANIFEST_AUTHORIZED) {
                 (void)snprintf(
-                    details,
-                    sizeof(details),
+                    buffers->details,
+                    AC_DRIVER_DETAILS_CAPACITY,
                     "{\"image_base\":\"0x%" PRIxPTR
                     "\",\"path\":\"%s\",\"file_sha256\":%s%s%s,"
                     "\"manifest_sha256\":\"%s\",\"reason\":\"%s\","
                     "\"verdict\":\"signal_only\"}",
                     (uintptr_t)drivers[index],
-                    escaped_path,
+                    buffers->escaped_path,
                     hash_available ? "\"" : "null",
                     hash_available ? digest : "",
                     hash_available ? "\"" : "",
@@ -536,7 +549,7 @@ void ac_threat_sensor_report_driver_snapshot(
                         ? AC_SEVERITY_HIGH : AC_SEVERITY_MEDIUM,
                     "kernel_driver_manifest_violation",
                     target_pid,
-                    details);
+                    buffers->details);
             }
         }
     }
@@ -566,6 +579,7 @@ void ac_threat_sensor_report_driver_snapshot(
             details);
     }
     free(drivers);
+    free(buffers);
 }
 
 void ac_threat_sensor_report_input_posture(
@@ -782,10 +796,13 @@ static bool ac_unicode_string_equals(
     const UNICODE_STRING *value,
     const wchar_t *expected)
 {
-    const size_t expected_length = expected != NULL ? wcslen(expected) : 0;
+    size_t expected_length;
 
-    return value != NULL && value->Buffer != NULL &&
-           value->Length == expected_length * sizeof(wchar_t) &&
+    if (value == NULL || value->Buffer == NULL || expected == NULL) {
+        return false;
+    }
+    expected_length = wcslen(expected);
+    return value->Length == expected_length * sizeof(wchar_t) &&
            _wcsnicmp(
                value->Buffer,
                expected,

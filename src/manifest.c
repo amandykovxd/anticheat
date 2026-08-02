@@ -74,7 +74,7 @@ static bool ac_manifest_hash_stream(
     uint64_t *size_out)
 {
     AcSha256 hash;
-    uint8_t buffer[16384];
+    uint8_t buffer[4096];
     uint64_t size = 0;
 
     ac_sha256_init(&hash);
@@ -135,7 +135,8 @@ static bool ac_manifest_push(
     int required;
     size_t index;
 
-    if (manifest->count >= AC_MANIFEST_MAX_ENTRIES ||
+    if (manifest->count > manifest->capacity ||
+        manifest->count >= AC_MANIFEST_MAX_ENTRIES ||
         file_name_utf8 == NULL || file_name_utf8[0] == '\0' ||
         strchr(file_name_utf8, '/') != NULL ||
         strchr(file_name_utf8, '\\') != NULL ||
@@ -181,7 +182,11 @@ static bool ac_manifest_push(
         manifest->entries = candidate;
         manifest->capacity = new_capacity;
     }
-    manifest->entries[manifest->count++] = entry;
+    if (manifest->entries == NULL || manifest->count >= manifest->capacity) {
+        return false;
+    }
+    manifest->entries[manifest->count] = entry;
+    ++manifest->count;
     return true;
 }
 
@@ -229,36 +234,34 @@ bool ac_manifest_load_pinned(
         goto fail;
     }
 
+    memset(line, 0, sizeof(line));
     while (fgets(line, (int)sizeof(line), file) != NULL) {
         char *context = NULL;
         char *kind_text;
         char *digest_text;
         char *file_name;
         char *extra;
-        char *cursor = line;
         const size_t length = strlen(line);
+        const size_t offset = strspn(line, " \t");
 
         if (length == sizeof(line) - 1u && line[length - 1u] != '\n') {
             goto fail;
         }
-        while (*cursor == ' ' || *cursor == '\t') {
-            ++cursor;
-        }
-        if (*cursor == '\0' || *cursor == '\r' || *cursor == '\n' ||
-            *cursor == '#') {
+        if (offset >= length || line[offset] == '\r' ||
+            line[offset] == '\n' || line[offset] == '#') {
             continue;
         }
-        cursor[strcspn(cursor, "\r\n")] = '\0';
+        line[offset + strcspn(line + offset, "\r\n")] = '\0';
 
         if (!header_seen) {
-            if (strcmp(cursor, "ac-manifest-v1") != 0) {
+            if (strcmp(line + offset, "ac-manifest-v1") != 0) {
                 goto fail;
             }
             header_seen = true;
             continue;
         }
 
-        kind_text = strtok_s(cursor, " \t", &context);
+        kind_text = strtok_s(line + offset, " \t", &context);
         digest_text = strtok_s(NULL, " \t", &context);
         file_name = strtok_s(NULL, " \t", &context);
         extra = strtok_s(NULL, " \t", &context);

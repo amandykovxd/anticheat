@@ -8,7 +8,7 @@ CatalogFile=AcTelemetry.cat
 PnpLockdown=1
 
 [DestinationDirs]
-DefaultDestDir=12
+DefaultDestDir=13
 
 [DefaultInstall.NTamd64]
 CopyFiles=DriverCopyFiles
@@ -24,7 +24,7 @@ DisplayName=%ServiceDisplayName%
 ServiceType=1
 StartType=3
 ErrorControl=1
-ServiceBinary=%12%\AcTelemetry.sys
+ServiceBinary=%13%\AcTelemetry.sys
 
 [SourceDisksFiles]
 AcTelemetry.sys=1

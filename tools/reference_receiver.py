@@ -790,6 +790,14 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
     def _require_authentication(self) -> bool:
         if self._authenticated():
             return True
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if 0 < length <= MAX_REQUEST_BYTES:
+            self.rfile.read(length)
+        elif length != 0:
+            self.close_connection = True
         self._write_json(
             HTTPStatus.UNAUTHORIZED,
             {"error": {"code": "authentication_required", "message": "invalid token"}},

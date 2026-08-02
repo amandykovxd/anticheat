@@ -16,8 +16,12 @@ msbuild driver\AcTelemetry.vcxproj `
 Validate the INF and package before deployment:
 
 ```powershell
-InfVerif.exe /w driver\AcTelemetry.inf
+InfVerif.exe /w /v driver\AcTelemetry.inf
 ```
+
+The GitHub-hosted build retains the unsigned SYS, INF, PDB symbols, verbose
+InfVerif output, and a SHA-256 checksum manifest in the
+`AcTelemetry-unsigned-x64` artifact.
 
 Development packages must be test-signed and loaded only on isolated test
 systems. Production packages require an applicable Microsoft signing path.

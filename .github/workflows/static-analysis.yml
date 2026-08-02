@@ -1,0 +1,107 @@
+name: static-analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: static-analysis-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    name: workflow and shell lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Validate GitHub Actions workflows
+        run: |
+          "$(go env GOPATH)/bin/actionlint" \
+            -config-file .github/actionlint.yaml
+
+      - name: Validate shell scripts
+        run: shellcheck tools/*.sh
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes clang clang-tidy
+
+      - name: Generate the compilation database
+        run: |
+          cmake -S . -B out/analyze/clang \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build out/analyze/clang --parallel
+
+      - name: Run clang static analysis
+        run: |
+          run-clang-tidy \
+            -p out/analyze/clang \
+            -quiet \
+            -checks='-*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
+            -warnings-as-errors='clang-analyzer-*'
+
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes cppcheck
+
+      - name: Generate the compilation database
+        run: |
+          cmake -S . -B out/analyze/cppcheck \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run Cppcheck
+        run: |
+          cppcheck \
+            --project=out/analyze/cppcheck/compile_commands.json \
+            --enable=warning,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem
+
+  msvc-code-analysis:
+    name: MSVC code analysis
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure with native code analysis
+        run: >-
+          cmake -S . -B out/analyze/msvc -A x64
+          -DBUILD_TESTING=ON
+          "-DCMAKE_C_FLAGS=/analyze"
+
+      - name: Build and analyze
+        run: cmake --build out/analyze/msvc --config Release --parallel

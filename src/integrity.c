@@ -180,16 +180,33 @@ void ac_integrity_cache_init(AcIntegrityCache *cache)
     cache->bytes_allocated = 0;
 }
 
-static void ac_integrity_baseline_release(AcIntegrityBaseline *baseline)
+static void ac_integrity_sections_release(
+    _In_reads_(section_count) AcIntegritySection *sections,
+    size_t section_count)
 {
     size_t index;
 
+    for (index = 0; index < section_count; ++index) {
+        /* The section array is zero-initialized, and section_count advances
+           only after block_hashes is assigned. MSVC does not propagate that
+           invariant through the cache release path. */
+#if defined(_MSC_VER)
+#pragma warning(suppress : 6001)
+#endif
+        free(sections[index].block_hashes);
+    }
+}
+
+static void ac_integrity_baseline_release(AcIntegrityBaseline *baseline)
+{
     if (baseline == NULL) {
         return;
     }
 
-    for (index = 0; index < baseline->section_count; ++index) {
-        free(baseline->sections[index].block_hashes);
+    if (baseline->sections != NULL) {
+        ac_integrity_sections_release(
+            baseline->sections,
+            baseline->section_count);
     }
     free(baseline->sections);
     free(baseline->export_rvas);
@@ -334,6 +351,11 @@ static bool ac_integrity_collect_iat_slot(void *user, uint32_t slot_rva, bool de
         collector->capacity = capacity;
     }
 
+    if (collector->slots == NULL || collector->delay_flags == NULL ||
+        collector->count >= collector->capacity) {
+        collector->failed = true;
+        return false;
+    }
     collector->slots[collector->count] = slot_rva;
     collector->delay_flags[collector->count] = delay_load ? 1u : 0u;
     ++collector->count;
@@ -458,8 +480,10 @@ static bool ac_integrity_build_baseline(
 
         ac_pe_mask_finalize(&baseline->mask);
 
-        block_count = (section->virtual_size + AC_INTEGRITY_BLOCK_SIZE - 1u) /
-                      AC_INTEGRITY_BLOCK_SIZE;
+        block_count = section->virtual_size / AC_INTEGRITY_BLOCK_SIZE;
+        if (section->virtual_size % AC_INTEGRITY_BLOCK_SIZE != 0) {
+            ++block_count;
+        }
         target = &baseline->sections[baseline->section_count];
         memcpy(target->name, section->name, AC_PE_SECTION_NAME_SIZE);
         target->rva = section->virtual_address;
@@ -475,11 +499,29 @@ static bool ac_integrity_build_baseline(
 
         for (block = 0; block < block_count; ++block) {
             const uint32_t offset = block * AC_INTEGRITY_BLOCK_SIZE;
-            const uint32_t length = section->virtual_size - offset < AC_INTEGRITY_BLOCK_SIZE
-                ? section->virtual_size - offset
+            uint32_t remaining;
+            uint32_t length;
+
+            if (offset >= section->virtual_size) {
+                ok = false;
+                break;
+            }
+            remaining = section->virtual_size - offset;
+            length = remaining < AC_INTEGRITY_BLOCK_SIZE
+                ? remaining
                 : AC_INTEGRITY_BLOCK_SIZE;
 
-            memcpy(context->integrity_expected, materialized + offset, length);
+            if (length == 0 || length > AC_INTEGRITY_BLOCK_SIZE ||
+                (uint64_t)offset + length > section->virtual_size) {
+                ok = false;
+                break;
+            }
+
+            (void)memcpy_s(
+                context->integrity_expected,
+                AC_INTEGRITY_BLOCK_SIZE,
+                materialized + offset,
+                length);
             ac_pe_mask_zero(
                 &baseline->mask,
                 context->integrity_expected,
@@ -489,6 +531,13 @@ static bool ac_integrity_build_baseline(
                 context->integrity_expected,
                 length,
                 target->block_hashes + (size_t)block * AC_SHA256_DIGEST_SIZE);
+        }
+
+        if (!ok) {
+            free(target->block_hashes);
+            target->block_hashes = NULL;
+            free(materialized);
+            break;
         }
 
         baseline->allocated_bytes +=

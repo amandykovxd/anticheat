@@ -608,7 +608,7 @@ bool ac_kernel_client_process_stats(
                 "{\"callbacks_active\":%u,\"expected_mask\":%u,"
                 "\"telemetry_complete\":false}",
                 stats->callbacks_active,
-                AC_DRIVER_CALLBACK_REQUIRED);
+                (unsigned int)AC_DRIVER_CALLBACK_REQUIRED);
             ac_log_event(
                 logger,
                 AC_SEVERITY_HIGH,
@@ -677,7 +677,7 @@ bool ac_kernel_client_drain(
     DWORD target_pid,
     uint64_t *events_out)
 {
-    AcDriverEvent events[AC_DRIVER_MAX_BATCH_EVENTS];
+    AcDriverEvent *events;
     uint64_t total = 0;
     unsigned int batch;
 
@@ -688,7 +688,15 @@ bool ac_kernel_client_drain(
         return false;
     }
 
+    events = (AcDriverEvent *)malloc(
+        (size_t)AC_DRIVER_MAX_BATCH_EVENTS * sizeof(*events));
+    if (events == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+
     if (!ac_kernel_client_check_health(client, logger, target_pid)) {
+        free(events);
         return false;
     }
 
@@ -703,14 +711,16 @@ bool ac_kernel_client_drain(
                 NULL,
                 0,
                 events,
-                (DWORD)sizeof(events),
+                (DWORD)((size_t)AC_DRIVER_MAX_BATCH_EVENTS * sizeof(*events)),
                 &returned,
                 NULL)) {
+            free(events);
             return false;
         }
 
         if (returned % (DWORD)sizeof(AcDriverEvent) != 0) {
             SetLastError(ERROR_INVALID_DATA);
+            free(events);
             return false;
         }
 
@@ -723,12 +733,14 @@ bool ac_kernel_client_drain(
                 events[index].protocol_version !=
                     AC_DRIVER_PROTOCOL_VERSION) {
                 SetLastError(ERROR_INVALID_DATA);
+                free(events);
                 return false;
             }
             if (!ac_kernel_client_observe_sequence(
                     client,
                     events[index].sequence,
                     &missing)) {
+                free(events);
                 return false;
             }
             if (missing > 0) {
@@ -768,12 +780,14 @@ bool ac_kernel_client_drain(
     }
 
     if (!ac_kernel_client_check_health(client, logger, target_pid)) {
+        free(events);
         return false;
     }
 
     if (events_out != NULL) {
         *events_out += total;
     }
+    free(events);
     return true;
 }
 
