@@ -1,9 +1,12 @@
 #include "ac.h"
 
+#include <fcntl.h>
 #include <io.h>
+#include <share.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <wchar.h>
 
 static int g_failures = 0;
@@ -1094,10 +1097,22 @@ static bool ac_test_write_text_file(
     const wchar_t *path,
     const char *content)
 {
-    FILE *file = _wfopen(path, L"wb");
+    int descriptor = -1;
+    FILE *file;
     const size_t length = strlen(content);
 
+    if (_wsopen_s(
+            &descriptor,
+            path,
+            _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+            _SH_DENYRW,
+            _S_IREAD | _S_IWRITE) != 0 ||
+        descriptor < 0) {
+        return false;
+    }
+    file = _fdopen(descriptor, "wb");
     if (file == NULL) {
+        (void)_close(descriptor);
         return false;
     }
     if (fwrite(content, 1u, length, file) != length) {
