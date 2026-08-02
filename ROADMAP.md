@@ -40,12 +40,12 @@ Deliverables:
 
 - WDK NuGet restore with a pinned SDK/WDK dependency set — implemented;
 - `msbuild` of `driver/AcTelemetry.vcxproj` — implemented;
-- `InfVerif` validation of `driver/AcTelemetry.inf`;
+- `InfVerif /w /v` validation of `driver/AcTelemetry.inf` — implemented;
 - test catalog generation;
 - static driver analysis;
 - CodeQL or equivalent analysis for user-mode code;
 - published unsigned development artifacts with SHA-256 checksums — implemented;
-- symbol artifact retention.
+- symbol artifact retention — implemented.
 
 Acceptance criteria:
 

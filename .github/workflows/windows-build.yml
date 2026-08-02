@@ -46,6 +46,8 @@ jobs:
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
+            /p:DebugSymbols=true `
+            /p:DebugType=full `
             "/p:OutDir=$output\"
           if ($LASTEXITCODE -ne 0) {
             throw "driver build exited with $LASTEXITCODE"
@@ -54,10 +56,41 @@ jobs:
           if (-not (Test-Path $driver)) {
             throw 'AcTelemetry.sys was not produced'
           }
-          Copy-Item 'driver\AcTelemetry.inf' $output
-          $digest = (Get-FileHash -Algorithm SHA256 $driver).Hash.ToLowerInvariant()
-          "$digest  AcTelemetry.sys" |
-            Set-Content -Encoding ascii (Join-Path $output 'SHA256SUMS')
+          $symbols = Get-ChildItem $output -Filter '*.pdb' -File
+          if (-not $symbols) {
+            throw 'Driver symbols were not produced'
+          }
+
+          $inf = Join-Path $output 'AcTelemetry.inf'
+          Copy-Item 'driver\AcTelemetry.inf' $inf
+          $infVerif = Get-ChildItem 'driver\packages' `
+            -Filter 'InfVerif.exe' `
+            -File `
+            -Recurse |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $infVerif) {
+            throw 'The pinned SDK package did not provide x64 InfVerif.exe'
+          }
+
+          $validation = Join-Path $output 'InfVerif.txt'
+          $validationOutput = & $infVerif.FullName /w /v $inf 2>&1
+          $validationExitCode = $LASTEXITCODE
+          $validationOutput | Tee-Object -FilePath $validation
+          if ($validationExitCode -ne 0) {
+            throw "InfVerif exited with $validationExitCode"
+          }
+
+          $checksumPath = Join-Path $output 'SHA256SUMS'
+          Get-ChildItem $output -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS' } |
+            Sort-Object Name |
+            ForEach-Object {
+              $digest = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+              "$digest  $($_.Name)"
+            } |
+            Set-Content -Encoding ascii $checksumPath
 
       - name: Upload unsigned driver package
         uses: actions/upload-artifact@v7

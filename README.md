@@ -282,13 +282,17 @@ Expected output:
 
 ```text
 driver\x64\Release\AcTelemetry.sys
+driver\x64\Release\AcTelemetry.pdb
 ```
 
 The CI artifact is explicitly named `AcTelemetry-unsigned-x64`; it is a build
-input, not a deployable production package. Development systems must use a
-test-signed package and an isolated test configuration. Production deployment
-requires a signed catalog and a driver package accepted by the applicable
-Microsoft signing process.
+input, not a deployable production package. CI validates the staged INF with
+the x64 `InfVerif.exe` supplied by the pinned SDK package using `/w /v`. The
+artifact contains `AcTelemetry.sys`, `AcTelemetry.inf`, PDB symbols,
+`InfVerif.txt`, and `SHA256SUMS`; the checksum file covers every other retained
+file. Development systems must use a test-signed package and an isolated test
+configuration. Production deployment requires a signed catalog and a driver
+package accepted by the applicable Microsoft signing process.
 
 The manual `driver-submission` workflow runs only on a protected self-hosted
 runner labelled `driver-signing`. It restores the WDK, builds the release
