@@ -304,7 +304,8 @@ static void test_log_chain_is_verifiable(void)
 {
     AcLogger logger;
     wchar_t path[MAX_PATH];
-    char line[32768];
+    const size_t line_capacity = 32768u;
+    char *line;
     uint8_t chain[AC_SHA256_DIGEST_SIZE];
     FILE *file;
     unsigned int line_count = 0;
@@ -329,7 +330,15 @@ static void test_log_chain_is_verifiable(void)
         return;
     }
 
-    while (fgets(line, (int)sizeof(line), file) != NULL) {
+    line = (char *)malloc(line_capacity);
+    AC_CHECK(line != NULL);
+    if (line == NULL) {
+        (void)fclose(file);
+        (void)_wremove(path);
+        return;
+    }
+
+    while (fgets(line, (int)line_capacity, file) != NULL) {
         AcSha256 hash;
         uint8_t computed[AC_SHA256_DIGEST_SIZE];
         char computed_hex[AC_SHA256_HEX_SIZE];
@@ -384,6 +393,7 @@ static void test_log_chain_is_verifiable(void)
     }
 
     (void)fclose(file);
+    free(line);
     AC_CHECK(line_count == 4u);
     (void)_wremove(path);
 }

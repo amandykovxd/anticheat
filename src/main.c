@@ -601,9 +601,9 @@ int wmain(int argc, wchar_t **argv)
 {
     AcOptions options;
     AcLogger logger;
-    AcContext context;
-    AcKernelClient kernel_client;
-    AcThreatSensor threat_sensor;
+    AcContext *context = NULL;
+    AcKernelClient *kernel_client = NULL;
+    AcThreatSensor *threat_sensor = NULL;
     AcPolicy policy;
     AcManifest manifest;
     AcCollectorAttestation attestation;
@@ -634,8 +634,6 @@ int wmain(int argc, wchar_t **argv)
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
-    memset(&threat_sensor, 0, sizeof(threat_sensor));
-    ac_kernel_client_init(&kernel_client);
     ac_manifest_init(&manifest);
     memset(&runtime_kernel_posture, 0, sizeof(runtime_kernel_posture));
 
@@ -664,6 +662,26 @@ int wmain(int argc, wchar_t **argv)
         return AC_EXIT_INTERNAL;
     }
     (void)SetConsoleCtrlHandler(ac_console_handler, TRUE);
+
+    context = (AcContext *)calloc(1u, sizeof(*context));
+    kernel_client = (AcKernelClient *)calloc(1u, sizeof(*kernel_client));
+    threat_sensor = (AcThreatSensor *)calloc(1u, sizeof(*threat_sensor));
+    if (context == NULL || kernel_client == NULL || threat_sensor == NULL) {
+        ac_log_event(
+            &logger,
+            AC_SEVERITY_HIGH,
+            "runtime_state_allocation_failed",
+            0,
+            "{\"reason\":\"out_of_memory\"}");
+        free(context);
+        free(kernel_client);
+        free(threat_sensor);
+        CloseHandle(g_stop_event);
+        g_stop_event = NULL;
+        ac_logger_close(&logger);
+        return AC_EXIT_INTERNAL;
+    }
+    ac_kernel_client_init(kernel_client);
 
     (void)snprintf(
         details,
@@ -848,7 +866,7 @@ int wmain(int argc, wchar_t **argv)
             options.dispatch_watch_count * sizeof(options.dispatch_watches[0]));
     }
 
-    if (!ac_context_init(&context, &logger, &policy)) {
+    if (!ac_context_init(context, &logger, &policy)) {
         ac_log_event(
             &logger,
             AC_SEVERITY_LOW,
@@ -860,7 +878,7 @@ int wmain(int argc, wchar_t **argv)
     context_ready = true;
 
     if (!ac_threat_sensor_init(
-            &threat_sensor,
+            threat_sensor,
             options.repeat_interval_ms)) {
         ac_log_event(
             &logger,
@@ -871,16 +889,16 @@ int wmain(int argc, wchar_t **argv)
     } else {
         threat_sensor_ready = true;
         ac_threat_sensor_report_posture(
-            &threat_sensor,
+            threat_sensor,
             &logger,
             target.pid);
         ac_threat_sensor_report_driver_snapshot(
-            &threat_sensor,
+            threat_sensor,
             &logger,
             target.pid,
             manifest_ready ? &manifest : NULL);
         ac_threat_sensor_report_input_posture(
-            &threat_sensor,
+            threat_sensor,
             &logger,
             target.pid);
     }
@@ -914,7 +932,7 @@ int wmain(int argc, wchar_t **argv)
     }
 
     if (options.kernel_telemetry) {
-        if (!ac_kernel_client_open(&kernel_client)) {
+        if (!ac_kernel_client_open(kernel_client)) {
             char kernel_error[128];
             const DWORD error = GetLastError();
             (void)snprintf(
@@ -934,7 +952,7 @@ int wmain(int argc, wchar_t **argv)
                 goto cleanup;
             }
         } else if (!ac_kernel_client_set_target(
-                       &kernel_client,
+                       kernel_client,
                        target.pid)) {
             const DWORD error = GetLastError();
             char kernel_error[128];
@@ -950,7 +968,7 @@ int wmain(int argc, wchar_t **argv)
                 target.pid,
                 kernel_error);
             kernel_telemetry_complete = false;
-            ac_kernel_client_close(&kernel_client);
+            ac_kernel_client_close(kernel_client);
             if (options.require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
@@ -963,9 +981,9 @@ int wmain(int argc, wchar_t **argv)
                 sizeof(kernel_details),
                 "{\"protocol_version\":%u,\"event_size\":%u,"
                 "\"queue_capacity\":%u,\"target_pid\":%lu}",
-                kernel_client.version.protocol_version,
-                kernel_client.version.event_size,
-                kernel_client.version.queue_capacity,
+                kernel_client->version.protocol_version,
+                kernel_client->version.event_size,
+                kernel_client->version.queue_capacity,
                 (unsigned long)target.pid);
             ac_log_event(
                 &logger,
@@ -990,38 +1008,38 @@ int wmain(int argc, wchar_t **argv)
 
         if (kernel_ready &&
             !ac_kernel_client_drain(
-                &kernel_client,
+                kernel_client,
                 &logger,
                 target.pid,
                 &kernel_events)) {
             kernel_telemetry_complete = false;
-            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_events_dropped = kernel_client->last_dropped;
             kernel_sequence_events_missing =
-                kernel_client.sequence_events_missing;
+                kernel_client->sequence_events_missing;
             ac_log_win32_error_severity(
                 &logger,
                 AC_SEVERITY_HIGH,
                 "kernel_event_read_failed",
                 target.pid,
                 GetLastError());
-            ac_kernel_client_close(&kernel_client);
+            ac_kernel_client_close(kernel_client);
             kernel_ready = false;
             if (options.require_kernel) {
                 exit_code = AC_EXIT_INTERNAL;
                 break;
             }
         } else if (kernel_ready) {
-            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_events_dropped = kernel_client->last_dropped;
             kernel_sequence_events_missing =
-                kernel_client.sequence_events_missing;
+                kernel_client->sequence_events_missing;
             kernel_telemetry_complete =
                 kernel_telemetry_complete &&
-                kernel_client.telemetry_complete;
+                kernel_client->telemetry_complete;
         }
 
         ++scan_id;
         scan_succeeded = ac_scan_process(
-            &context,
+            context,
             &target,
             scan_id,
             &stats);
@@ -1071,11 +1089,11 @@ int wmain(int argc, wchar_t **argv)
 
         if (threat_sensor_ready) {
             ac_threat_sensor_scan(
-                &threat_sensor,
+                threat_sensor,
                 &logger,
                 target.pid,
                 scan_id,
-                &context.module_ranges,
+                &context->module_ranges,
                 &threat_stats);
             threat_indicators_observed += threat_stats.indicators_observed;
             threat_overlay_candidates += threat_stats.overlay_candidates;
@@ -1084,42 +1102,42 @@ int wmain(int argc, wchar_t **argv)
 
         if (kernel_ready &&
             !ac_kernel_client_drain(
-                &kernel_client,
+                kernel_client,
                 &logger,
                 target.pid,
                 &kernel_events)) {
             kernel_telemetry_complete = false;
-            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_events_dropped = kernel_client->last_dropped;
             kernel_sequence_events_missing =
-                kernel_client.sequence_events_missing;
+                kernel_client->sequence_events_missing;
             ac_log_win32_error_severity(
                 &logger,
                 AC_SEVERITY_HIGH,
                 "kernel_event_read_failed",
                 target.pid,
                 GetLastError());
-            ac_kernel_client_close(&kernel_client);
+            ac_kernel_client_close(kernel_client);
             kernel_ready = false;
             if (options.require_kernel) {
                 exit_code = AC_EXIT_INTERNAL;
                 break;
             }
         } else if (kernel_ready) {
-            kernel_events_dropped = kernel_client.last_dropped;
+            kernel_events_dropped = kernel_client->last_dropped;
             kernel_sequence_events_missing =
-                kernel_client.sequence_events_missing;
+                kernel_client->sequence_events_missing;
             if (scan_succeeded) {
                 ac_kernel_client_correlate_scan(
-                    &kernel_client,
+                    kernel_client,
                     &logger,
                     target.pid,
                     scan_id,
-                    &context.module_ranges,
+                    &context->module_ranges,
                     &kernel_module_mismatches);
             }
             kernel_telemetry_complete =
                 kernel_telemetry_complete &&
-                kernel_client.telemetry_complete;
+                kernel_client->telemetry_complete;
         }
 
         if (options.once) {
@@ -1157,33 +1175,33 @@ int wmain(int argc, wchar_t **argv)
 
                 if (kernel_ready &&
                     !ac_kernel_client_drain(
-                        &kernel_client,
+                        kernel_client,
                         &logger,
                         target.pid,
                         &kernel_events)) {
                     kernel_telemetry_complete = false;
-                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_events_dropped = kernel_client->last_dropped;
                     kernel_sequence_events_missing =
-                        kernel_client.sequence_events_missing;
+                        kernel_client->sequence_events_missing;
                     ac_log_win32_error_severity(
                         &logger,
                         AC_SEVERITY_HIGH,
                         "kernel_event_read_failed",
                         target.pid,
                         GetLastError());
-                    ac_kernel_client_close(&kernel_client);
+                    ac_kernel_client_close(kernel_client);
                     kernel_ready = false;
                     if (options.require_kernel) {
                         exit_code = AC_EXIT_INTERNAL;
                         goto cleanup;
                     }
                 } else if (kernel_ready) {
-                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_events_dropped = kernel_client->last_dropped;
                     kernel_sequence_events_missing =
-                        kernel_client.sequence_events_missing;
+                        kernel_client->sequence_events_missing;
                     kernel_telemetry_complete =
                         kernel_telemetry_complete &&
-                        kernel_client.telemetry_complete;
+                        kernel_client->telemetry_complete;
                 }
             }
 
@@ -1195,21 +1213,21 @@ int wmain(int argc, wchar_t **argv)
         if (wait_result == WAIT_OBJECT_0) {
             if (kernel_ready) {
                 if (ac_kernel_client_drain(
-                        &kernel_client,
+                        kernel_client,
                         &logger,
                         target.pid,
                         &kernel_events)) {
-                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_events_dropped = kernel_client->last_dropped;
                     kernel_sequence_events_missing =
-                        kernel_client.sequence_events_missing;
+                        kernel_client->sequence_events_missing;
                     kernel_telemetry_complete =
                         kernel_telemetry_complete &&
-                        kernel_client.telemetry_complete;
+                        kernel_client->telemetry_complete;
                 } else {
                     kernel_telemetry_complete = false;
-                    kernel_events_dropped = kernel_client.last_dropped;
+                    kernel_events_dropped = kernel_client->last_dropped;
                     kernel_sequence_events_missing =
-                        kernel_client.sequence_events_missing;
+                        kernel_client->sequence_events_missing;
                     ac_log_win32_error_severity(
                         &logger,
                         AC_SEVERITY_HIGH,
@@ -1267,14 +1285,14 @@ cleanup:
     ac_log_event(&logger, AC_SEVERITY_INFO, "agent_stopped", target.pid, details);
 
     if (context_ready) {
-        ac_context_free(&context);
+        ac_context_free(context);
     }
     if (threat_sensor_ready) {
-        ac_threat_sensor_free(&threat_sensor);
+        ac_threat_sensor_free(threat_sensor);
     }
     if (kernel_ready) {
-        (void)ac_kernel_client_set_target(&kernel_client, 0);
-        ac_kernel_client_close(&kernel_client);
+        (void)ac_kernel_client_set_target(kernel_client, 0);
+        ac_kernel_client_close(kernel_client);
     }
     if (target.process != NULL) {
         CloseHandle(target.process);
@@ -1287,5 +1305,8 @@ cleanup:
     }
     ac_manifest_free(&manifest);
     ac_logger_close(&logger);
+    free(threat_sensor);
+    free(kernel_client);
+    free(context);
     return exit_code;
 }
