@@ -436,19 +436,24 @@ static void test_log_rotation(void)
 
 static void test_policy_defaults(void)
 {
-    AcPolicy policy;
+    AcPolicy *policy = (AcPolicy *)calloc(1u, sizeof(*policy));
 
-    ac_policy_init_defaults(&policy);
-    AC_CHECK(policy.allow_root_count == 0);
-    AC_CHECK(policy.probe_budget_bytes > 0);
-    AC_CHECK(policy.scan_budget_ms > 0);
-    AC_CHECK(policy.max_regions > 0);
-    AC_CHECK(policy.hash_unknown_modules);
-    AC_CHECK(policy.probe_region_content);
-    AC_CHECK(policy.verify_module_integrity);
-    AC_CHECK(policy.integrity_budget_bytes > 0);
-    AC_CHECK(policy.integrity_max_file_bytes > 0);
-    AC_CHECK(policy.integrity_baseline_budget_bytes > 0);
+    AC_CHECK(policy != NULL);
+    if (policy == NULL) {
+        return;
+    }
+    ac_policy_init_defaults(policy);
+    AC_CHECK(policy->allow_root_count == 0);
+    AC_CHECK(policy->probe_budget_bytes > 0);
+    AC_CHECK(policy->scan_budget_ms > 0);
+    AC_CHECK(policy->max_regions > 0);
+    AC_CHECK(policy->hash_unknown_modules);
+    AC_CHECK(policy->probe_region_content);
+    AC_CHECK(policy->verify_module_integrity);
+    AC_CHECK(policy->integrity_budget_bytes > 0);
+    AC_CHECK(policy->integrity_max_file_bytes > 0);
+    AC_CHECK(policy->integrity_baseline_budget_bytes > 0);
+    free(policy);
 }
 
 static void test_open_process_uses_read_only_access(void)

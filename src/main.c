@@ -599,12 +599,12 @@ static void ac_log_collector_identity(AcLogger *logger)
 
 int wmain(int argc, wchar_t **argv)
 {
-    AcOptions options;
+    AcOptions *options;
     AcLogger logger;
     AcContext *context = NULL;
     AcKernelClient *kernel_client = NULL;
     AcThreatSensor *threat_sensor = NULL;
-    AcPolicy policy;
+    AcPolicy *policy = NULL;
     AcManifest manifest;
     AcCollectorAttestation attestation;
     AcRuntimeKernelPosture runtime_kernel_posture;
@@ -633,25 +633,32 @@ int wmain(int argc, wchar_t **argv)
     bool attestation_complete = false;
     int exit_code = AC_EXIT_INTERNAL;
 
+    options = (AcOptions *)calloc(1u, sizeof(*options));
+    if (options == NULL) {
+        return AC_EXIT_INTERNAL;
+    }
     memset(&target, 0, sizeof(target));
     ac_manifest_init(&manifest);
     memset(&runtime_kernel_posture, 0, sizeof(runtime_kernel_posture));
 
-    if (!ac_parse_options(argc, argv, &options, &exit_now)) {
+    if (!ac_parse_options(argc, argv, options, &exit_now)) {
         ac_print_usage(argv[0]);
+        free(options);
         return AC_EXIT_USAGE;
     }
     if (exit_now) {
+        free(options);
         return AC_EXIT_OK;
     }
 
     if (!ac_logger_open(
             &logger,
-            options.log_path,
-            !options.quiet,
-            options.max_log_bytes,
-            options.log_generations)) {
-        fwprintf(stderr, L"Cannot open log file: %ls\n", options.log_path);
+            options->log_path,
+            !options->quiet,
+            options->max_log_bytes,
+            options->log_generations)) {
+        fwprintf(stderr, L"Cannot open log file: %ls\n", options->log_path);
+        free(options);
         return AC_EXIT_LOG_FAILURE;
     }
 
@@ -659,6 +666,7 @@ int wmain(int argc, wchar_t **argv)
     if (g_stop_event == NULL) {
         ac_log_win32_error(&logger, "create_stop_event_failed", 0, GetLastError());
         ac_logger_close(&logger);
+        free(options);
         return AC_EXIT_INTERNAL;
     }
     (void)SetConsoleCtrlHandler(ac_console_handler, TRUE);
@@ -666,7 +674,9 @@ int wmain(int argc, wchar_t **argv)
     context = (AcContext *)calloc(1u, sizeof(*context));
     kernel_client = (AcKernelClient *)calloc(1u, sizeof(*kernel_client));
     threat_sensor = (AcThreatSensor *)calloc(1u, sizeof(*threat_sensor));
-    if (context == NULL || kernel_client == NULL || threat_sensor == NULL) {
+    policy = (AcPolicy *)calloc(1u, sizeof(*policy));
+    if (context == NULL || kernel_client == NULL || threat_sensor == NULL ||
+        policy == NULL) {
         ac_log_event(
             &logger,
             AC_SEVERITY_HIGH,
@@ -676,9 +686,11 @@ int wmain(int argc, wchar_t **argv)
         free(context);
         free(kernel_client);
         free(threat_sensor);
+        free(policy);
         CloseHandle(g_stop_event);
         g_stop_event = NULL;
         ac_logger_close(&logger);
+        free(options);
         return AC_EXIT_INTERNAL;
     }
     ac_kernel_client_init(kernel_client);
@@ -693,21 +705,21 @@ int wmain(int argc, wchar_t **argv)
         AC_AGENT_NAME,
         AC_AGENT_VERSION,
         AC_SCHEMA_VERSION,
-        options.kernel_telemetry
+        options->kernel_telemetry
             ? "hybrid_kernel_user_telemetry"
             : "user_telemetry",
-        (unsigned long)options.interval_ms,
-        options.once ? "true" : "false",
-        options.scan_budget_ms,
-        options.repeat_interval_ms,
+        (unsigned long)options->interval_ms,
+        options->once ? "true" : "false",
+        options->scan_budget_ms,
+        options->repeat_interval_ms,
         sizeof(void *) * 8u);
     ac_log_event(&logger, AC_SEVERITY_INFO, "agent_started", 0, details);
     ac_log_collector_identity(&logger);
 
-    if (options.attestation_challenge != NULL) {
+    if (options->attestation_challenge != NULL) {
         if (!ac_collector_attest(
-                options.attestation_challenge,
-                options.attestation_nonce,
+                options->attestation_challenge,
+                options->attestation_nonce,
                 &attestation)) {
             ac_log_win32_error_severity(
                 &logger,
@@ -715,14 +727,14 @@ int wmain(int argc, wchar_t **argv)
                 "collector_attestation_failed",
                 0,
                 GetLastError());
-            if (options.require_attestation) {
+            if (options->require_attestation) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
             }
         } else {
             ac_log_collector_attestation(&logger, 0, 0, &attestation);
             attestation_complete = attestation.mapped_matches_disk;
-            if (!attestation_complete && options.require_attestation) {
+            if (!attestation_complete && options->require_attestation) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
             }
@@ -737,18 +749,18 @@ int wmain(int argc, wchar_t **argv)
             "\"freshness_proof\":false}");
     }
 
-    if (options.manifest_path != NULL) {
+    if (options->manifest_path != NULL) {
         if (!ac_manifest_load_pinned(
                 &manifest,
-                options.manifest_path,
-                options.manifest_sha256)) {
+                options->manifest_path,
+                options->manifest_sha256)) {
             ac_log_win32_error_severity(
                 &logger,
                 AC_SEVERITY_HIGH,
                 "trusted_manifest_rejected",
                 0,
                 GetLastError());
-            if (options.require_manifest) {
+            if (options->require_manifest) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
             }
@@ -784,7 +796,7 @@ int wmain(int argc, wchar_t **argv)
         runtime_kernel_posture.query_complete = false;
     }
     ac_log_runtime_kernel_posture(&logger, 0, &runtime_kernel_posture);
-    if (options.require_secure_kernel &&
+    if (options->require_secure_kernel &&
         !ac_runtime_kernel_posture_secure(&runtime_kernel_posture)) {
         ac_log_event(
             &logger,
@@ -796,7 +808,7 @@ int wmain(int argc, wchar_t **argv)
         goto cleanup;
     }
 
-    if (!ac_resolve_target_pid(&options, &logger, &target.pid)) {
+    if (!ac_resolve_target_pid(options, &logger, &target.pid)) {
         exit_code = ac_stop_requested() ? AC_EXIT_OK : AC_EXIT_TARGET_NOT_FOUND;
         goto cleanup;
     }
@@ -813,8 +825,8 @@ int wmain(int argc, wchar_t **argv)
         goto cleanup;
     }
 
-    if (options.process_name != NULL &&
-        !ac_process_image_matches_name(target.image_path, options.process_name)) {
+    if (options->process_name != NULL &&
+        !ac_process_image_matches_name(target.image_path, options->process_name)) {
         ac_log_text_event(
             &logger,
             AC_SEVERITY_MEDIUM,
@@ -838,35 +850,35 @@ int wmain(int argc, wchar_t **argv)
     ac_read_directory(program_files_x86, MAX_PATH, L"ProgramFiles(x86)");
 
     root_count = ac_build_allow_roots(
-        &options,
+        options,
         target.directory,
         windows_directory,
         program_files,
         program_files_x86,
         roots);
 
-    ac_policy_init_defaults(&policy);
-    policy.allow_root_count = root_count;
+    ac_policy_init_defaults(policy);
+    policy->allow_root_count = root_count;
     for (root_index = 0; root_index < root_count; ++root_index) {
-        policy.allow_roots[root_index] = roots[root_index];
+        policy->allow_roots[root_index] = roots[root_index];
     }
-    policy.repeat_interval_ms = options.repeat_interval_ms;
-    policy.scan_budget_ms = options.scan_budget_ms;
-    policy.hash_unknown_modules = !options.skip_module_hashes;
-    policy.probe_region_content = !options.skip_region_probe;
-    policy.verify_module_integrity = !options.skip_module_integrity;
-    policy.integrity_budget_bytes = options.integrity_budget_bytes;
-    policy.integrity_max_file_bytes = options.integrity_max_file_bytes;
-    policy.manifest = manifest_ready ? &manifest : NULL;
-    policy.dispatch_watch_count = options.dispatch_watch_count;
-    if (options.dispatch_watch_count > 0) {
+    policy->repeat_interval_ms = options->repeat_interval_ms;
+    policy->scan_budget_ms = options->scan_budget_ms;
+    policy->hash_unknown_modules = !options->skip_module_hashes;
+    policy->probe_region_content = !options->skip_region_probe;
+    policy->verify_module_integrity = !options->skip_module_integrity;
+    policy->integrity_budget_bytes = options->integrity_budget_bytes;
+    policy->integrity_max_file_bytes = options->integrity_max_file_bytes;
+    policy->manifest = manifest_ready ? &manifest : NULL;
+    policy->dispatch_watch_count = options->dispatch_watch_count;
+    if (options->dispatch_watch_count > 0) {
         memcpy(
-            policy.dispatch_watches,
-            options.dispatch_watches,
-            options.dispatch_watch_count * sizeof(options.dispatch_watches[0]));
+            policy->dispatch_watches,
+            options->dispatch_watches,
+            options->dispatch_watch_count * sizeof(options->dispatch_watches[0]));
     }
 
-    if (!ac_context_init(context, &logger, &policy)) {
+    if (!ac_context_init(context, &logger, policy)) {
         ac_log_event(
             &logger,
             AC_SEVERITY_LOW,
@@ -879,7 +891,7 @@ int wmain(int argc, wchar_t **argv)
 
     if (!ac_threat_sensor_init(
             threat_sensor,
-            options.repeat_interval_ms)) {
+            options->repeat_interval_ms)) {
         ac_log_event(
             &logger,
             AC_SEVERITY_LOW,
@@ -931,7 +943,7 @@ int wmain(int argc, wchar_t **argv)
         ac_log_event(&logger, AC_SEVERITY_INFO, "target_opened", target.pid, target_details);
     }
 
-    if (options.kernel_telemetry) {
+    if (options->kernel_telemetry) {
         if (!ac_kernel_client_open(kernel_client)) {
             char kernel_error[128];
             const DWORD error = GetLastError();
@@ -942,12 +954,12 @@ int wmain(int argc, wchar_t **argv)
                 (unsigned long)error);
             ac_log_event(
                 &logger,
-                options.require_kernel ? AC_SEVERITY_HIGH : AC_SEVERITY_MEDIUM,
+                options->require_kernel ? AC_SEVERITY_HIGH : AC_SEVERITY_MEDIUM,
                 "kernel_driver_open_failed",
                 target.pid,
                 kernel_error);
             kernel_telemetry_complete = false;
-            if (options.require_kernel) {
+            if (options->require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
             }
@@ -969,7 +981,7 @@ int wmain(int argc, wchar_t **argv)
                 kernel_error);
             kernel_telemetry_complete = false;
             ac_kernel_client_close(kernel_client);
-            if (options.require_kernel) {
+            if (options->require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
             }
@@ -1024,7 +1036,7 @@ int wmain(int argc, wchar_t **argv)
                 GetLastError());
             ac_kernel_client_close(kernel_client);
             kernel_ready = false;
-            if (options.require_kernel) {
+            if (options->require_kernel) {
                 exit_code = AC_EXIT_INTERNAL;
                 break;
             }
@@ -1054,10 +1066,10 @@ int wmain(int argc, wchar_t **argv)
             ac_log_win32_error(&logger, "scan_failed", target.pid, error);
         }
 
-        if (options.attestation_challenge != NULL) {
+        if (options->attestation_challenge != NULL) {
             if (!ac_collector_attest(
-                    options.attestation_challenge,
-                    options.attestation_nonce,
+                    options->attestation_challenge,
+                    options->attestation_nonce,
                     &attestation)) {
                 attestation_complete = false;
                 ac_log_win32_error_severity(
@@ -1066,7 +1078,7 @@ int wmain(int argc, wchar_t **argv)
                     "collector_attestation_failed",
                     target.pid,
                     GetLastError());
-                if (options.require_attestation) {
+                if (options->require_attestation) {
                     exit_code = AC_EXIT_INTERNAL;
                     break;
                 }
@@ -1080,7 +1092,7 @@ int wmain(int argc, wchar_t **argv)
                     attestation_complete &&
                     attestation.mapped_matches_disk;
                 if (!attestation.mapped_matches_disk &&
-                    options.require_attestation) {
+                    options->require_attestation) {
                     exit_code = AC_EXIT_ACCESS_DENIED;
                     break;
                 }
@@ -1118,7 +1130,7 @@ int wmain(int argc, wchar_t **argv)
                 GetLastError());
             ac_kernel_client_close(kernel_client);
             kernel_ready = false;
-            if (options.require_kernel) {
+            if (options->require_kernel) {
                 exit_code = AC_EXIT_INTERNAL;
                 break;
             }
@@ -1140,14 +1152,14 @@ int wmain(int argc, wchar_t **argv)
                 kernel_client->telemetry_complete;
         }
 
-        if (options.once) {
+        if (options->once) {
             exit_code = AC_EXIT_OK;
             break;
         }
 
         {
             const ULONGLONG deadline =
-                GetTickCount64() + ac_jittered_interval(options.interval_ms);
+                GetTickCount64() + ac_jittered_interval(options->interval_ms);
             bool next_scan = false;
 
             wait_handles[0] = target.process;
@@ -1191,7 +1203,7 @@ int wmain(int argc, wchar_t **argv)
                         GetLastError());
                     ac_kernel_client_close(kernel_client);
                     kernel_ready = false;
-                    if (options.require_kernel) {
+                    if (options->require_kernel) {
                         exit_code = AC_EXIT_INTERNAL;
                         goto cleanup;
                     }
@@ -1246,7 +1258,7 @@ int wmain(int argc, wchar_t **argv)
         }
         if (wait_result == WAIT_FAILED) {
             ac_log_win32_error(&logger, "wait_failed", target.pid, GetLastError());
-            Sleep(ac_jittered_interval(options.interval_ms));
+            Sleep(ac_jittered_interval(options->interval_ms));
         }
     }
 
@@ -1274,9 +1286,9 @@ cleanup:
         threat_indicators_observed,
         threat_overlay_candidates,
         threat_events_emitted,
-        (options.attestation_challenge != NULL && attestation_complete)
+        (options->attestation_challenge != NULL && attestation_complete)
             ? "true" : "false",
-        (options.kernel_telemetry && kernel_telemetry_complete)
+        (options->kernel_telemetry && kernel_telemetry_complete)
             ? "true"
             : "false",
         logger.write_failures,
@@ -1308,5 +1320,7 @@ cleanup:
     free(threat_sensor);
     free(kernel_client);
     free(context);
+    free(policy);
+    free(options);
     return exit_code;
 }
