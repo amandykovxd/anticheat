@@ -480,8 +480,8 @@ static void test_open_process_uses_read_only_access(void)
 static void test_scan_of_self_produces_events(void)
 {
     AcLogger logger;
-    AcContext context;
-    AcPolicy policy;
+    AcContext *context;
+    AcPolicy *policy;
     AcTarget target;
     AcScanStats stats;
     wchar_t path[MAX_PATH];
@@ -493,11 +493,23 @@ static void test_scan_of_self_produces_events(void)
     }
     (void)_wremove(path);
 
+    context = (AcContext *)calloc(1u, sizeof(*context));
+    policy = (AcPolicy *)calloc(1u, sizeof(*policy));
+    AC_CHECK(context != NULL);
+    AC_CHECK(policy != NULL);
+    if (context == NULL || policy == NULL) {
+        free(context);
+        free(policy);
+        return;
+    }
+
     memset(&target, 0, sizeof(target));
     target.pid = GetCurrentProcessId();
     target.process = ac_open_process_for_scan(target.pid, &target.granted_access);
     AC_CHECK(target.process != NULL);
     if (target.process == NULL) {
+        free(context);
+        free(policy);
         return;
     }
 
@@ -509,27 +521,29 @@ static void test_scan_of_self_produces_events(void)
         windows_directory,
         (UINT)(sizeof(windows_directory) / sizeof(windows_directory[0])));
 
-    ac_policy_init_defaults(&policy);
-    policy.allow_root_count = 2u;
-    policy.allow_roots[0] = target.directory;
-    policy.allow_roots[1] = windows_directory;
+    ac_policy_init_defaults(policy);
+    policy->allow_root_count = 2u;
+    policy->allow_roots[0] = target.directory;
+    policy->allow_roots[1] = windows_directory;
 
     AC_CHECK(ac_logger_open(&logger, path, false, 0, 0));
-    AC_CHECK(ac_context_init(&context, &logger, &policy));
+    AC_CHECK(ac_context_init(context, &logger, policy));
 
     memset(&stats, 0, sizeof(stats));
-    AC_CHECK(ac_scan_process(&context, &target, 1u, &stats));
+    AC_CHECK(ac_scan_process(context, &target, 1u, &stats));
     AC_CHECK(stats.module_count > 0);
     AC_CHECK(stats.regions_visited > 0);
     AC_CHECK(stats.executable_region_count > 0);
     AC_CHECK(stats.duration_ms < 60000u);
     AC_CHECK(logger.write_failures == 0);
 
-    ac_context_free(&context);
+    ac_context_free(context);
     ac_logger_close(&logger);
     CloseHandle(target.process);
     free(target.image_path);
     free(target.directory);
+    free(policy);
+    free(context);
     (void)_wremove(path);
 }
 
