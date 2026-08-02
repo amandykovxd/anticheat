@@ -511,7 +511,17 @@ static bool ac_integrity_build_baseline(
                 ? remaining
                 : AC_INTEGRITY_BLOCK_SIZE;
 
-            memcpy(context->integrity_expected, materialized + offset, length);
+            if (length == 0 || length > AC_INTEGRITY_BLOCK_SIZE ||
+                (uint64_t)offset + length > section->virtual_size) {
+                ok = false;
+                break;
+            }
+
+            (void)memcpy_s(
+                context->integrity_expected,
+                AC_INTEGRITY_BLOCK_SIZE,
+                materialized + offset,
+                length);
             ac_pe_mask_zero(
                 &baseline->mask,
                 context->integrity_expected,
