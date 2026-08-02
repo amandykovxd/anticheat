@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,12 +35,22 @@ typedef struct AcLinuxLogger {
 typedef struct AcLinuxOptions {
     const char *process_name;
     const char *log_path;
+    const char *audit_log_path;
     pid_t pid;
     unsigned int interval_ms;
     bool once;
     bool self;
     bool quiet;
+    bool require_kernel_audit;
 } AcLinuxOptions;
+
+typedef struct AcLinuxAuditSensor {
+    FILE *file;
+    const char *path;
+    dev_t device;
+    ino_t inode;
+    bool available;
+} AcLinuxAuditSensor;
 
 static volatile sig_atomic_t g_stop;
 
@@ -95,6 +106,10 @@ static void ac_linux_usage(const char *program)
         "  --once               perform one scan and exit\n"
         "  --interval-ms <n>    scan period, 1000..3600000 (default 5000)\n"
         "  --log <file>         JSON Lines output\n"
+        "  --audit-log <file>   consume auditd SYSCALL records tagged "
+        "anticheat_process_vm\n"
+        "  --require-kernel-audit\n"
+        "                       fail closed when the audit stream is unavailable\n"
         "  --quiet              do not mirror events to stdout\n"
         "  --version            print version information\n"
         "  --help               print this help\n",
@@ -149,6 +164,10 @@ static bool ac_linux_parse_options(
             options->process_name = argv[++index];
         } else if (strcmp(argument, "--log") == 0 && index + 1 < argc) {
             options->log_path = argv[++index];
+        } else if (strcmp(argument, "--audit-log") == 0 && index + 1 < argc) {
+            options->audit_log_path = argv[++index];
+        } else if (strcmp(argument, "--require-kernel-audit") == 0) {
+            options->require_kernel_audit = true;
         } else if (strcmp(argument, "--interval-ms") == 0 &&
                    index + 1 < argc) {
             char *end = NULL;
@@ -526,10 +545,222 @@ static void ac_linux_scan_foreign_fds(
     (void)closedir(processes);
 }
 
+static bool ac_linux_audit_value(
+    const char *line,
+    const char *name,
+    char *value,
+    size_t capacity)
+{
+    const size_t name_length = strlen(name);
+    const char *cursor = line;
+    const char *end;
+    size_t length;
+
+    if (capacity == 0u) {
+        return false;
+    }
+    while ((cursor = strstr(cursor, name)) != NULL) {
+        if ((cursor == line || cursor[-1] == ' ') &&
+            cursor[name_length] == '=') {
+            cursor += name_length + 1u;
+            break;
+        }
+        cursor += name_length;
+    }
+    if (cursor == NULL) {
+        return false;
+    }
+    if (*cursor == '"') {
+        ++cursor;
+        end = strchr(cursor, '"');
+    } else {
+        end = cursor + strcspn(cursor, " \t\r\n");
+    }
+    if (end == NULL) {
+        return false;
+    }
+    length = (size_t)(end - cursor);
+    if (length == 0u || length >= capacity) {
+        return false;
+    }
+    memcpy(value, cursor, length);
+    value[length] = '\0';
+    return true;
+}
+
+static int ac_linux_audit_operation(const char *arch, const char *syscall_name)
+{
+    char *end = NULL;
+    unsigned long number;
+
+    if (strcmp(syscall_name, "process_vm_readv") == 0) {
+        return 1;
+    }
+    if (strcmp(syscall_name, "process_vm_writev") == 0) {
+        return 2;
+    }
+    errno = 0;
+    number = strtoul(syscall_name, &end, 10);
+    if (errno != 0 || end == syscall_name || *end != '\0') {
+        return 0;
+    }
+    if (strcmp(arch, "c000003e") == 0) {
+        return number == 310u ? 1 : (number == 311u ? 2 : 0);
+    }
+    if (strcmp(arch, "40000003") == 0) {
+        return number == 347u ? 1 : (number == 348u ? 2 : 0);
+    }
+    if (strcmp(arch, "c00000b7") == 0) {
+        return number == 270u ? 1 : (number == 271u ? 2 : 0);
+    }
+    return 0;
+}
+
+static bool ac_linux_audit_open(AcLinuxAuditSensor *sensor)
+{
+    struct stat status;
+
+    sensor->file = fopen(sensor->path, "rb");
+    if (sensor->file == NULL || fstat(fileno(sensor->file), &status) != 0) {
+        if (sensor->file != NULL) {
+            (void)fclose(sensor->file);
+            sensor->file = NULL;
+        }
+        sensor->available = false;
+        return false;
+    }
+    sensor->device = status.st_dev;
+    sensor->inode = status.st_ino;
+    sensor->available = true;
+    return true;
+}
+
+static bool ac_linux_audit_refresh(AcLinuxAuditSensor *sensor)
+{
+    struct stat status;
+
+    if (sensor->path == NULL) {
+        return true;
+    }
+    if (!sensor->available || sensor->file == NULL) {
+        return ac_linux_audit_open(sensor);
+    }
+    if (stat(sensor->path, &status) != 0) {
+        (void)fclose(sensor->file);
+        sensor->file = NULL;
+        sensor->available = false;
+        return false;
+    }
+    if (status.st_dev == sensor->device && status.st_ino == sensor->inode) {
+        return true;
+    }
+    (void)fclose(sensor->file);
+    sensor->file = NULL;
+    sensor->available = false;
+    return ac_linux_audit_open(sensor);
+}
+
+static bool ac_linux_scan_audit(
+    AcLinuxAuditSensor *sensor,
+    AcLinuxLogger *logger,
+    pid_t target_pid,
+    uint64_t scan_id,
+    size_t *signals_out)
+{
+    char line[8192];
+
+    *signals_out = 0u;
+    if (!ac_linux_audit_refresh(sensor)) {
+        return false;
+    }
+    if (!sensor->available || sensor->file == NULL) {
+        return true;
+    }
+    clearerr(sensor->file);
+    while (fgets(line, sizeof(line), sensor->file) != NULL) {
+        char key[64];
+        char arch[32];
+        char syscall_name[64];
+        char target_hex[32];
+        char actor_text[32];
+        char success_text[16];
+        char executable[PATH_MAX];
+        char escaped_executable[AC_LINUX_JSON_PATH_CAPACITY];
+        char details[AC_LINUX_JSON_PATH_CAPACITY + 512u];
+        char *end = NULL;
+        unsigned long target;
+        unsigned long actor;
+        int operation;
+        bool success;
+
+        if (strstr(line, "type=SYSCALL") == NULL ||
+            !ac_linux_audit_value(line, "key", key, sizeof(key)) ||
+            strcmp(key, "anticheat_process_vm") != 0 ||
+            !ac_linux_audit_value(line, "arch", arch, sizeof(arch)) ||
+            !ac_linux_audit_value(
+                line, "syscall", syscall_name, sizeof(syscall_name)) ||
+            !ac_linux_audit_value(line, "a0", target_hex, sizeof(target_hex)) ||
+            !ac_linux_audit_value(line, "pid", actor_text, sizeof(actor_text))) {
+            continue;
+        }
+        operation = ac_linux_audit_operation(arch, syscall_name);
+        if (operation == 0) {
+            continue;
+        }
+        errno = 0;
+        target = strtoul(target_hex, &end, 16);
+        if (errno != 0 || end == target_hex || *end != '\0' ||
+            target != (unsigned long)target_pid) {
+            continue;
+        }
+        errno = 0;
+        actor = strtoul(actor_text, &end, 10);
+        if (errno != 0 || end == actor_text || *end != '\0' || actor > INT_MAX) {
+            continue;
+        }
+        success = ac_linux_audit_value(
+                      line, "success", success_text, sizeof(success_text)) &&
+                  strcmp(success_text, "yes") == 0;
+        if (!ac_linux_audit_value(
+                line, "exe", executable, sizeof(executable))) {
+            (void)snprintf(executable, sizeof(executable), "%s", "<unavailable>");
+        }
+        if (!ac_json_escape(
+                executable, escaped_executable, sizeof(escaped_executable))) {
+            (void)snprintf(
+                escaped_executable,
+                sizeof(escaped_executable),
+                "%s",
+                "<path-escape-truncated>");
+        }
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"scan_id\":%" PRIu64
+            ",\"actor_pid\":%lu,\"operation\":\"%s\","
+            "\"success\":%s,\"executable\":\"%s\","
+            "\"source\":\"linux_audit\",\"verdict\":\"signal_only\"}",
+            scan_id,
+            actor,
+            operation == 2 ? "process_vm_writev" : "process_vm_readv",
+            success ? "true" : "false",
+            escaped_executable);
+        ac_linux_log(
+            logger,
+            operation == 2 && success ? "high" : "medium",
+            "linux_process_vm_access_observed",
+            target_pid,
+            details);
+        ++*signals_out;
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     AcLinuxOptions options;
     AcLinuxLogger logger;
+    AcLinuxAuditSensor audit_sensor;
     bool exit_now;
     char target_path[PATH_MAX];
     char escaped_path[AC_LINUX_JSON_PATH_CAPACITY];
@@ -553,6 +784,8 @@ int main(int argc, char **argv)
     if (!ac_linux_logger_open(&logger, options.log_path, !options.quiet)) {
         return 3;
     }
+    memset(&audit_sensor, 0, sizeof(audit_sensor));
+    audit_sensor.path = options.audit_log_path;
     (void)signal(SIGINT, ac_linux_signal);
     (void)signal(SIGTERM, ac_linux_signal);
 
@@ -590,21 +823,52 @@ int main(int argc, char **argv)
         "{\"path\":\"%s\",\"metadata_api\":\"procfs\"}",
         escaped_path);
     ac_linux_log(&logger, "info", "target_opened", options.pid, details);
-    ac_linux_log(
-        &logger,
-        "medium",
-        "linux_kernel_audit_unavailable",
-        options.pid,
-        "{\"process_vm_readv_observed\":false,"
-        "\"process_vm_writev_observed\":false,"
-        "\"required_sensor\":\"eBPF_LSM_or_audit\","
-        "\"verdict\":\"capability_gap\"}");
+    if (options.audit_log_path != NULL) {
+        (void)ac_linux_audit_open(&audit_sensor);
+    }
+    if (audit_sensor.available) {
+        char escaped_audit_path[AC_LINUX_JSON_PATH_CAPACITY];
+        if (!ac_json_escape(
+                options.audit_log_path,
+                escaped_audit_path,
+                sizeof(escaped_audit_path))) {
+            (void)snprintf(
+                escaped_audit_path,
+                sizeof(escaped_audit_path),
+                "%s",
+                "<path-escape-truncated>");
+        }
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"source\":\"linux_audit\",\"path\":\"%s\","
+            "\"key\":\"anticheat_process_vm\"}",
+            escaped_audit_path);
+        ac_linux_log(
+            &logger, "info", "linux_kernel_audit_connected", options.pid, details);
+    } else {
+        ac_linux_log(
+            &logger,
+            options.require_kernel_audit ? "high" : "medium",
+            "linux_kernel_audit_unavailable",
+            options.pid,
+            "{\"process_vm_readv_observed\":false,"
+            "\"process_vm_writev_observed\":false,"
+            "\"required_sensor\":\"linux_audit\","
+            "\"verdict\":\"capability_gap\"}");
+        if (options.require_kernel_audit) {
+            exit_code = 6;
+            goto cleanup;
+        }
+    }
 
     while (!g_stop) {
         size_t regions = 0;
         size_t suspicious = 0;
         size_t fds_visited = 0;
         size_t fd_signals = 0;
+        size_t audit_signals;
+        bool audit_scan_complete;
         const unsigned long tracer = ac_linux_tracer_pid(options.pid);
         struct timespec delay;
 
@@ -635,12 +899,27 @@ int main(int argc, char **argv)
             scan_id,
             &fds_visited,
             &fd_signals);
+        audit_scan_complete = ac_linux_scan_audit(
+            &audit_sensor, &logger, options.pid, scan_id, &audit_signals);
+        if (!audit_scan_complete) {
+            ac_linux_log(
+                &logger,
+                options.require_kernel_audit ? "high" : "medium",
+                "linux_kernel_audit_lost",
+                options.pid,
+                "{\"source\":\"linux_audit\","
+                "\"verdict\":\"capability_gap\"}");
+            if (options.require_kernel_audit) {
+                exit_code = 6;
+            }
+        }
         (void)snprintf(
             details,
             sizeof(details),
             "{\"scan_id\":%" PRIu64 ",\"regions\":%zu,"
             "\"suspicious_mappings\":%zu,\"fds_visited\":%zu,"
             "\"fd_signals\":%zu,\"tracer_pid\":%lu,"
+            "\"audit_signals\":%zu,\"kernel_audit\":%s,"
             "\"complete\":%s}",
             scan_id,
             regions,
@@ -648,13 +927,19 @@ int main(int argc, char **argv)
             fds_visited,
             fd_signals,
             tracer,
-            fds_visited < AC_LINUX_MAX_FDS ? "true" : "false");
+            audit_signals,
+            audit_sensor.available ? "true" : "false",
+            (fds_visited < AC_LINUX_MAX_FDS && audit_scan_complete)
+                ? "true" : "false");
         ac_linux_log(
             &logger,
             "info",
             "scan_completed",
             options.pid,
             details);
+        if (exit_code != 0) {
+            break;
+        }
         if (options.once) {
             break;
         }
@@ -677,6 +962,9 @@ cleanup:
         "agent_stopped",
         options.pid,
         details);
+    if (audit_sensor.file != NULL) {
+        (void)fclose(audit_sensor.file);
+    }
     (void)fclose(logger.file);
     return exit_code;
 }

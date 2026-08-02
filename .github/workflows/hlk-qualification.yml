@@ -1,0 +1,45 @@
+name: hlk-qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_definition:
+        description: Absolute PDEF path on the HLK Controller
+        required: true
+      expected_package:
+        description: Absolute .hlkx output path declared by the PDEF
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anticheat-hlk-lab
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Execute HLK test collection
+    runs-on: [self-hosted, windows, x64, hlk-controller]
+    environment: driver-qualification
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run HLK project
+        shell: pwsh
+        run: |
+          .\tools\windows\Invoke-HlkQualification.ps1 `
+            -ProjectDefinition '${{ inputs.project_definition }}' `
+            -ExpectedPackage '${{ inputs.expected_package }}' `
+            -EvidenceDirectory out\hlk
+          Copy-Item '${{ inputs.expected_package }}' out\hlk\AcTelemetry.hlkx
+
+      - name: Upload HLK evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: AcTelemetry-hlk-${{ github.run_id }}
+          path: out/hlk
+          if-no-files-found: warn
+          retention-days: 30

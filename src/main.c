@@ -37,6 +37,10 @@ typedef struct AcOptions {
     const wchar_t *manifest_path;
     const wchar_t *manifest_sha256;
     bool require_manifest;
+    const wchar_t *attestation_challenge;
+    const wchar_t *attestation_nonce;
+    bool require_attestation;
+    bool require_secure_kernel;
     AcDispatchWatch dispatch_watches[AC_MAX_DISPATCH_WATCHES];
     size_t dispatch_watch_count;
 } AcOptions;
@@ -126,10 +130,14 @@ static void ac_print_usage(const wchar_t *program)
         L"  --manifest <file>         trusted module/driver manifest\n"
         L"  --manifest-sha256 <hex>   control-plane pin for the manifest file\n"
         L"  --require-manifest        fail when the pinned manifest is unavailable\n"
+        L"  --attestation-challenge <id>  server challenge id (32 hex)\n"
+        L"  --attestation-nonce <hex>     server nonce (64 hex)\n"
+        L"  --require-attestation     fail on missing or inconsistent self-attestation\n"
         L"\n"
         L"Kernel telemetry:\n"
         L"  --kernel                  consume AcTelemetry driver events when available\n"
         L"  --require-kernel          fail if the driver cannot be opened or configured\n"
+        L"  --require-secure-kernel   require Secure Boot, CI, and enforced HVCI\n"
         L"\n"
         L"Output:\n"
         L"  --log <file>              JSON Lines output (default anticheat-events.jsonl)\n"
@@ -137,6 +145,7 @@ static void ac_print_usage(const wchar_t *program)
         L"  --log-generations <n>     rotated files to keep (default 5)\n"
         L"  --quiet                   do not mirror events to stdout\n"
         L"  --version                 print version and exit\n"
+        L"  --print-attestation-digest  print release attestation identity and exit\n"
         L"  --help                    print this help and exit\n"
         L"\n"
         L"Exit codes: 0 ok, 2 usage, 3 log failure, 4 target not found, "
@@ -157,6 +166,51 @@ static void ac_print_version(void)
         AC_AGENT_VERSION,
         AC_SCHEMA_VERSION,
         AC_DRIVER_PROTOCOL_VERSION);
+}
+
+static bool ac_print_attestation_digest(void)
+{
+    static const wchar_t challenge[] =
+        L"00000000000000000000000000000000";
+    static const wchar_t nonce[] =
+        L"0000000000000000000000000000000000000000000000000000000000000000";
+    AcCollectorAttestation result;
+
+    if (!ac_collector_attest(challenge, nonce, &result)) {
+        fwprintf(
+            stderr,
+            L"Cannot calculate collector attestation identity: %lu\n",
+            (unsigned long)GetLastError());
+        return false;
+    }
+    printf(
+        "collector_file_sha256=%s\n"
+        "collector_expected_mapped_sha256=%s\n"
+        "collector_observed_mapped_sha256=%s\n"
+        "collector_mapped_matches_disk=%s\n",
+        result.file_sha256,
+        result.expected_mapped_sha256,
+        result.observed_mapped_sha256,
+        result.mapped_matches_disk ? "true" : "false");
+    return result.mapped_matches_disk;
+}
+
+static bool ac_wide_hex_length(const wchar_t *text, size_t length)
+{
+    size_t index;
+
+    if (text == NULL || wcslen(text) != length) {
+        return false;
+    }
+    for (index = 0; index < length; ++index) {
+        const wchar_t value = text[index];
+        if (!((value >= L'0' && value <= L'9') ||
+              (value >= L'a' && value <= L'f') ||
+              (value >= L'A' && value <= L'F'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ac_parse_u64(
@@ -201,6 +255,11 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         ac_print_version();
         *exit_now = true;
         return true;
+    }
+    if (argc == 2 &&
+        wcscmp(argv[1], L"--print-attestation-digest") == 0) {
+        *exit_now = true;
+        return ac_print_attestation_digest();
     }
 
     for (index = 1; index < argc; ++index) {
@@ -258,12 +317,22 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         } else if (wcscmp(argument, L"--require-kernel") == 0) {
             options->kernel_telemetry = true;
             options->require_kernel = true;
+        } else if (wcscmp(argument, L"--require-secure-kernel") == 0) {
+            options->require_secure_kernel = true;
         } else if (wcscmp(argument, L"--manifest") == 0 && has_value) {
             options->manifest_path = argv[++index];
         } else if (wcscmp(argument, L"--manifest-sha256") == 0 && has_value) {
             options->manifest_sha256 = argv[++index];
         } else if (wcscmp(argument, L"--require-manifest") == 0) {
             options->require_manifest = true;
+        } else if (wcscmp(argument, L"--attestation-challenge") == 0 &&
+                   has_value) {
+            options->attestation_challenge = argv[++index];
+        } else if (wcscmp(argument, L"--attestation-nonce") == 0 &&
+                   has_value) {
+            options->attestation_nonce = argv[++index];
+        } else if (wcscmp(argument, L"--require-attestation") == 0) {
+            options->require_attestation = true;
         } else if (wcscmp(argument, L"--process") == 0 && has_value) {
             options->process_name = argv[++index];
         } else if (wcscmp(argument, L"--log") == 0 && has_value) {
@@ -315,7 +384,18 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
 
     if ((options->manifest_path == NULL) !=
             (options->manifest_sha256 == NULL) ||
-        (options->require_manifest && options->manifest_path == NULL)) {
+        (options->require_manifest && options->manifest_path == NULL) ||
+        (options->attestation_challenge == NULL) !=
+            (options->attestation_nonce == NULL) ||
+        (options->require_attestation &&
+         options->attestation_challenge == NULL) ||
+        (options->attestation_challenge != NULL &&
+         (!ac_wide_hex_length(
+              options->attestation_challenge,
+              AC_ATTESTATION_CHALLENGE_HEX_SIZE - 1u) ||
+          !ac_wide_hex_length(
+              options->attestation_nonce,
+              AC_SHA256_HEX_SIZE - 1u)))) {
         return false;
     }
     if (options->pid != 0) {
@@ -526,6 +606,8 @@ int wmain(int argc, wchar_t **argv)
     AcThreatSensor threat_sensor;
     AcPolicy policy;
     AcManifest manifest;
+    AcCollectorAttestation attestation;
+    AcRuntimeKernelPosture runtime_kernel_posture;
     AcTarget target;
     const wchar_t *roots[AC_MAX_ALLOW_ROOTS];
     wchar_t windows_directory[MAX_PATH];
@@ -548,12 +630,14 @@ int wmain(int argc, wchar_t **argv)
     bool threat_sensor_ready = false;
     bool kernel_telemetry_complete = true;
     bool manifest_ready = false;
+    bool attestation_complete = false;
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
     memset(&threat_sensor, 0, sizeof(threat_sensor));
     ac_kernel_client_init(&kernel_client);
     ac_manifest_init(&manifest);
+    memset(&runtime_kernel_posture, 0, sizeof(runtime_kernel_posture));
 
     if (!ac_parse_options(argc, argv, &options, &exit_now)) {
         ac_print_usage(argv[0]);
@@ -602,6 +686,39 @@ int wmain(int argc, wchar_t **argv)
     ac_log_event(&logger, AC_SEVERITY_INFO, "agent_started", 0, details);
     ac_log_collector_identity(&logger);
 
+    if (options.attestation_challenge != NULL) {
+        if (!ac_collector_attest(
+                options.attestation_challenge,
+                options.attestation_nonce,
+                &attestation)) {
+            ac_log_win32_error_severity(
+                &logger,
+                AC_SEVERITY_HIGH,
+                "collector_attestation_failed",
+                0,
+                GetLastError());
+            if (options.require_attestation) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        } else {
+            ac_log_collector_attestation(&logger, 0, 0, &attestation);
+            attestation_complete = attestation.mapped_matches_disk;
+            if (!attestation_complete && options.require_attestation) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        }
+    } else {
+        ac_log_event(
+            &logger,
+            AC_SEVERITY_MEDIUM,
+            "collector_attestation_unavailable",
+            0,
+            "{\"reason\":\"server_challenge_not_supplied\","
+            "\"freshness_proof\":false}");
+    }
+
     if (options.manifest_path != NULL) {
         if (!ac_manifest_load_pinned(
                 &manifest,
@@ -643,6 +760,22 @@ int wmain(int argc, wchar_t **argv)
             "{\"module_authorization\":false,"
             "\"driver_authorization\":false,"
             "\"required_action\":\"supply_control_plane_pin\"}");
+    }
+
+    if (!ac_query_runtime_kernel_posture(&runtime_kernel_posture)) {
+        runtime_kernel_posture.query_complete = false;
+    }
+    ac_log_runtime_kernel_posture(&logger, 0, &runtime_kernel_posture);
+    if (options.require_secure_kernel &&
+        !ac_runtime_kernel_posture_secure(&runtime_kernel_posture)) {
+        ac_log_event(
+            &logger,
+            AC_SEVERITY_HIGH,
+            "secure_kernel_policy_rejected",
+            0,
+            "{\"required\":true,\"verdict\":\"fail_closed\"}");
+        exit_code = AC_EXIT_ACCESS_DENIED;
+        goto cleanup;
     }
 
     if (!ac_resolve_target_pid(&options, &logger, &target.pid)) {
@@ -903,6 +1036,39 @@ int wmain(int argc, wchar_t **argv)
             ac_log_win32_error(&logger, "scan_failed", target.pid, error);
         }
 
+        if (options.attestation_challenge != NULL) {
+            if (!ac_collector_attest(
+                    options.attestation_challenge,
+                    options.attestation_nonce,
+                    &attestation)) {
+                attestation_complete = false;
+                ac_log_win32_error_severity(
+                    &logger,
+                    AC_SEVERITY_HIGH,
+                    "collector_attestation_failed",
+                    target.pid,
+                    GetLastError());
+                if (options.require_attestation) {
+                    exit_code = AC_EXIT_INTERNAL;
+                    break;
+                }
+            } else {
+                ac_log_collector_attestation(
+                    &logger,
+                    target.pid,
+                    scan_id,
+                    &attestation);
+                attestation_complete =
+                    attestation_complete &&
+                    attestation.mapped_matches_disk;
+                if (!attestation.mapped_matches_disk &&
+                    options.require_attestation) {
+                    exit_code = AC_EXIT_ACCESS_DENIED;
+                    break;
+                }
+            }
+        }
+
         if (threat_sensor_ready) {
             ac_threat_sensor_scan(
                 &threat_sensor,
@@ -1078,6 +1244,7 @@ cleanup:
         "\"threat_indicators_observed\":%" PRIu64 ","
         "\"threat_overlay_candidates\":%" PRIu64 ","
         "\"threat_events_emitted\":%" PRIu64 ","
+        "\"collector_attestation_complete\":%s,"
         "\"kernel_telemetry_complete\":%s,"
         "\"log_write_failures\":%" PRIu64 ",\"log_truncated_lines\":%" PRIu64 ","
         "\"exit_code\":%d}",
@@ -1089,6 +1256,8 @@ cleanup:
         threat_indicators_observed,
         threat_overlay_candidates,
         threat_events_emitted,
+        (options.attestation_challenge != NULL && attestation_complete)
+            ? "true" : "false",
         (options.kernel_telemetry && kernel_telemetry_complete)
             ? "true"
             : "false",

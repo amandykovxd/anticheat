@@ -231,11 +231,12 @@ limit metadata visibility for unrelated processes. See
 
 ## Build and run on Linux
 
-The Linux target is a procfs collector. It inventories executable mappings,
-`TracerPid`, foreign file descriptors referring to `/proc/<target>/mem`, and
-processes holding `/dev/uinput`. It does not claim visibility into
-`process_vm_readv` or `process_vm_writev`; reliable observation of those calls
-requires an integrator-owned eBPF LSM or audit sensor.
+The Linux target combines procfs inventory with an optional Linux Audit input.
+It inventories executable mappings, `TracerPid`, foreign file descriptors
+referring to `/proc/<target>/mem`, and processes holding `/dev/uinput`.
+Audit records tagged `anticheat_process_vm` identify successful and attempted
+`process_vm_readv` or `process_vm_writev` calls whose first argument is the
+protected PID.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
@@ -244,9 +245,21 @@ ctest --test-dir build --output-on-failure
 ./build/anticheat --pid 1234 --once --log anticheat-events.jsonl
 ```
 
-The collector emits `linux_kernel_audit_unavailable` when the kernel audit
-layer is not integrated. A backend must treat that record as a coverage gap,
-not as evidence that cross-process memory access did not occur.
+Install the audit rules and require the source in production:
+
+```bash
+sudo ./tools/install_linux_audit_rules.sh
+sudo ./build/anticheat --pid 1234 \
+  --audit-log /var/log/audit/audit.log \
+  --require-kernel-audit \
+  --log /var/log/anticheat/events.jsonl
+```
+
+The collector exits with code `6` when `--require-kernel-audit` is set and the
+stream cannot be opened. Without the flag it emits
+`linux_kernel_audit_unavailable`; the backend must treat that record as a
+coverage gap. Audit records remain local-kernel evidence and are not reliable
+against a kernel attacker able to alter audit itself.
 
 ## Build the kernel driver
 
@@ -277,6 +290,25 @@ test-signed package and an isolated test configuration. Production deployment
 requires a signed catalog and a driver package accepted by the applicable
 Microsoft signing process.
 
+The manual `driver-submission` workflow runs only on a protected self-hosted
+runner labelled `driver-signing`. It restores the WDK, builds the release
+driver, runs Inf2Cat, signs the binary, catalog, and Partner Center submission
+CAB with an EV certificate held in the runner certificate store, and retains
+hash evidence. The resulting CAB is not deployable: submit it to Partner
+Center, then validate the returned Microsoft-signed package with:
+
+```powershell
+.\tools\windows\Test-MicrosoftSignedDriver.ps1 `
+  -PackageDirectory C:\release\partner-center-return `
+  -EvidencePath C:\release\microsoft-signature-evidence.json
+```
+
+`driver-verifier` exposes separate `Enable`, post-reboot `Query`, and `Reset`
+phases on a disposable self-hosted driver test VM. `hlk-qualification` runs an
+integrator-supplied PDEF through `HlkExecutionEngine.exe` on an HLK Controller
+and uploads the `.hlkx` package and digest evidence. These workflows require
+protected environments and cannot run on GitHub-hosted workers.
+
 Microsoft references:
 
 - [Download and install the WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk)
@@ -284,6 +316,10 @@ Microsoft references:
 - [Build a driver with MSBuild](https://learn.microsoft.com/windows-hardware/drivers/develop/building-a-driver)
 - [Driver package components](https://learn.microsoft.com/windows-hardware/drivers/install/components-of-a-driver-package)
 - [Test-signing driver packages](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-driver-packages)
+- [Attestation sign Windows drivers](https://learn.microsoft.com/windows-hardware/drivers/dashboard/code-signing-attestation)
+- [Driver Verifier](https://learn.microsoft.com/windows-hardware/drivers/devtest/driver-verifier)
+- [Windows Hardware Lab Kit](https://learn.microsoft.com/windows-hardware/test/hlk/)
+- [HLK Automation Tool](https://learn.microsoft.com/windows-hardware/test/hlk/user/hlk-automation-tool)
 
 ## Development installation
 
@@ -341,6 +377,17 @@ Require an operational kernel driver:
   --log anticheat-events.jsonl
 ```
 
+Require runtime Secure Boot, kernel Code Integrity, enforced HVCI, and reject
+test-signing or kernel-debug modes:
+
+```powershell
+.\build\Release\anticheat.exe `
+  --pid 1234 `
+  --require-kernel `
+  --require-secure-kernel `
+  --log anticheat-events.jsonl
+```
+
 `--kernel` continues with user-mode collection when the driver is unavailable.
 `--require-kernel` exits with a nonzero status if the device cannot be opened,
 the protocol version is incompatible, target registration fails, or event
@@ -366,11 +413,13 @@ Deliver the manifest hash over the authenticated launcher/control-plane
 channel. Do not read the expected hash from a file stored beside the manifest;
 that would allow an endpoint attacker to replace both values.
 
-1. Build and sign `AcTelemetry.sys` for the target Windows release.
+1. Build, qualify, submit, and verify the Microsoft-signed driver package.
 2. Install and start the `AcTelemetry` driver service during product setup.
 3. Start the protected application and retain its PID and process handle.
-4. Start the collector with `--pid`, `--require-kernel`,
-   `--require-manifest`, `--manifest`, and `--manifest-sha256`.
+4. Request a receiver challenge and start the collector with `--pid`,
+   `--require-kernel`, `--require-secure-kernel`, `--require-manifest`,
+   `--manifest`, `--manifest-sha256`, `--attestation-challenge`,
+   `--attestation-nonce`, and `--require-attestation`.
 5. Start `tools/telemetry_shipper.py` against the JSONL path and an
    authenticated HTTPS receiver.
 6. Confirm server session registration, batch acknowledgements, and heartbeat
@@ -407,6 +456,7 @@ state at the next scan.
 | `--allow-root <dir>` | Add an expected module root. Repeatable. |
 | `--kernel` | Consume driver events when the driver is available. |
 | `--require-kernel` | Require driver connectivity and protocol compatibility. |
+| `--require-secure-kernel` | Fail unless runtime Secure Boot, Code Integrity, and HVCI enforcement are active and test/debug modes are disabled. |
 | `--scan-budget-ms <n>` | Emit an event when a scan exceeds the configured duration. |
 | `--repeat-interval-ms <n>` | Re-emit a de-duplicated finding after `n` milliseconds. |
 | `--no-module-hashes` | Disable SHA-256 calculation for modules outside allowed roots. |
@@ -416,6 +466,10 @@ state at the next scan.
 | `--manifest <path>` | Load the module and driver authorization manifest. |
 | `--manifest-sha256 <hex>` | Pin the manifest to a SHA-256 value supplied by the control plane. |
 | `--require-manifest` | Exit when the pinned manifest is absent or invalid. |
+| `--attestation-challenge <hex>` | Set the 16-byte server challenge identifier. |
+| `--attestation-nonce <hex>` | Set the 32-byte server nonce. |
+| `--require-attestation` | Fail if the nonce-bound collector self-measurement is absent or inconsistent. |
+| `--print-attestation-digest` | Print release file and normalized mapped-image digests, then exit. |
 | `--log <path>` | Set the JSONL output path. |
 | `--max-log-bytes <n>` | Rotate the active log after `n` bytes. `0` disables rotation. |
 | `--log-generations <n>` | Set the number of retained rotated segments. |

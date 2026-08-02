@@ -1,0 +1,71 @@
+name: driver-submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamp_url:
+        description: RFC 3161 HTTPS timestamp service
+        required: true
+        default: https://timestamp.digicert.com
+
+permissions:
+  contents: read
+
+concurrency:
+  group: driver-submission-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-sign-submission:
+    name: EV-sign Partner Center submission
+    runs-on: [self-hosted, windows, x64, driver-signing]
+    environment: driver-production-signing
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore WDK packages
+        shell: pwsh
+        run: nuget restore driver\packages.config -PackagesDirectory driver\packages
+
+      - name: Build release driver
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' |
+            Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild was not found' }
+          $output = Join-Path $PWD 'out\driver\x64\Release'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          & $msbuild driver\AcTelemetry.vcxproj /m `
+            /p:Configuration=Release /p:Platform=x64 "/p:OutDir=$output\"
+          if ($LASTEXITCODE -ne 0) { throw "driver build exited with $LASTEXITCODE" }
+          Copy-Item driver\AcTelemetry.inf $output
+
+      - name: Create EV-signed submission CAB
+        shell: pwsh
+        env:
+          AC_DRIVER_SIGNING_CERT_SHA1: ${{ secrets.AC_DRIVER_SIGNING_CERT_SHA1 }}
+        run: |
+          if (-not $env:AC_DRIVER_SIGNING_CERT_SHA1) {
+            throw 'AC_DRIVER_SIGNING_CERT_SHA1 is not configured'
+          }
+          .\tools\windows\New-DriverSubmission.ps1 `
+            -DriverBuildDirectory out\driver\x64\Release `
+            -OutputDirectory out\driver-submission `
+            -CertificateThumbprint $env:AC_DRIVER_SIGNING_CERT_SHA1 `
+            -TimestampUrl '${{ inputs.timestamp_url }}' `
+            -MachineCertificateStore
+
+      - name: Upload Partner Center submission
+        uses: actions/upload-artifact@v7
+        with:
+          name: AcTelemetry-partner-center-submission
+          path: |
+            out/driver-submission/AcTelemetry-submission.cab
+            out/driver-submission/submission-evidence.json
+          if-no-files-found: error
+          retention-days: 7

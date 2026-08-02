@@ -1,0 +1,46 @@
+name: driver-verifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Enable before reboot, Query after reboot/tests, or Reset
+        required: true
+        type: choice
+        options:
+          - Enable
+          - Query
+          - Reset
+
+permissions:
+  contents: read
+
+concurrency:
+  group: driver-verifier-lab
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    name: Driver Verifier ${{ inputs.phase }}
+    runs-on: [self-hosted, windows, x64, anticheat-driver-test]
+    environment: driver-qualification
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Execute Driver Verifier phase
+        shell: pwsh
+        run: |
+          .\tools\windows\Invoke-DriverVerifier.ps1 `
+            -Action '${{ inputs.phase }}' `
+            -DriverName AcTelemetry.sys `
+            -EvidenceDirectory out\driver-verifier
+
+      - name: Upload verifier evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: driver-verifier-${{ inputs.phase }}-${{ github.run_id }}
+          path: out/driver-verifier
+          if-no-files-found: warn
+          retention-days: 30

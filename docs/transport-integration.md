@@ -48,8 +48,28 @@ python tools/reference_receiver.py \
   --cert /etc/anticheat/tls/server-chain.pem \
   --key /etc/anticheat/tls/server-key.pem \
   --client-ca /etc/anticheat/tls/client-ca.pem \
-  --heartbeat-ms 15000
+  --heartbeat-ms 15000 \
+  --trusted-collector launcher-node-017:<collector-file-sha256>:<mapped-image-sha256>
 ```
+
+Obtain the two trusted digests from the exact signed release binary on a clean
+Windows build host with `anticheat.exe --print-attestation-digest`. Register
+them through protected receiver configuration, not endpoint storage.
+
+Before launching the collector, request a fresh challenge:
+
+```text
+python tools/request_attestation_challenge.py \
+  --endpoint https://telemetry.example.internal:8443 \
+  --collector-id launcher-node-017 \
+  --ca-file /etc/anticheat/receiver-ca.pem
+```
+
+Pass the returned `challenge_id` and `nonce` to
+`--attestation-challenge`, `--attestation-nonce`, and
+`--require-attestation`. The nonce is not written to the event stream; the
+collector logs its digest and a domain-separated response over the challenge,
+nonce, file digest, and normalized mapped-image digest.
 
 The unauthenticated `GET /healthz` endpoint reports process availability. All
 session endpoints require the bearer credential. Place the service behind
@@ -95,11 +115,18 @@ verification.
 
 | Method and path | Function |
 | --- | --- |
+| `POST /v1/attestations/challenges` | Issue a short-lived one-time nonce for a registered collector identity. |
 | `POST /v1/sessions` | Idempotently register a client session and return a server session ID. |
 | `POST /v1/sessions/{id}/batches` | Verify and anchor the next ordered event batch. |
 | `POST /v1/sessions/{id}/heartbeat` | Confirm liveness and the latest accepted remote anchor. |
 | `GET /v1/sessions/{id}` | Return authenticated session state for operations. |
 | `GET /healthz` | Return receiver process health. |
+
+For configured trusted collectors, the receiver validates
+`collector_attestation_observed` inside the authenticated hash chain, consumes
+the challenge for exactly one server session, and rejects heartbeat until the
+attestation is anchored. A response containing a different release digest,
+mapped image, nonce, or session replay is rejected.
 
 Session registration includes:
 

@@ -102,6 +102,45 @@ def batch_request(
     }
 
 
+def make_attestation_records(
+    seed: str,
+    challenge: dict[str, Any],
+    file_digest: str,
+    mapped_digest: str,
+    response_override: str | None = None,
+) -> list[bytes]:
+    first, chain = make_record(
+        1,
+        "log_segment_opened",
+        {"schema": 5, "chain_seed": seed},
+        seed,
+    )
+    nonce_digest = hashlib.sha256(bytes.fromhex(challenge["nonce"])).hexdigest()
+    response = hashlib.sha256(
+        b"ac-collector-attestation-v1"
+        + bytes.fromhex(challenge["challenge_id"])
+        + bytes.fromhex(challenge["nonce"])
+        + bytes.fromhex(file_digest)
+        + bytes.fromhex(mapped_digest)
+    ).hexdigest()
+    attestation, _ = make_record(
+        2,
+        "collector_attestation_observed",
+        {
+            "challenge_id": challenge["challenge_id"],
+            "nonce_sha256": nonce_digest,
+            "file_sha256": file_digest,
+            "expected_mapped_sha256": mapped_digest,
+            "observed_mapped_sha256": mapped_digest,
+            "response_sha256": response_override or response,
+            "mapped_matches_disk": True,
+            "complete": True,
+        },
+        chain,
+    )
+    return [first, attestation]
+
+
 class DirectStoreClient:
     def __init__(self, store: ReceiverStore):
         self.store = store
@@ -249,6 +288,115 @@ class ReceiverStoreTests(unittest.TestCase):
         with self.assertRaises(ReceiverError) as captured:
             self.store.append_heartbeat(self.session_id, heartbeat)
         self.assertEqual(captured.exception.code, "heartbeat_anchor_mismatch")
+
+
+class CollectorAttestationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.file_digest = "1" * 64
+        self.mapped_digest = "2" * 64
+        self.store = ReceiverStore(
+            Path(self.temporary.name) / "receiver.sqlite3",
+            trusted_collectors={
+                "test-endpoint": (self.file_digest, self.mapped_digest)
+            },
+            attestation_ttl_ms=60_000,
+        )
+
+    def _challenge_and_session(self) -> tuple[dict[str, Any], str, str]:
+        status, challenge = self.store.create_attestation_challenge(
+            {"collector_id": "test-endpoint"}
+        )
+        self.assertEqual(status, HTTPStatus.CREATED)
+        seed = "3" * 64
+        status, session = self.store.create_session(
+            session_request(seed, schema_version=5)
+        )
+        self.assertEqual(status, HTTPStatus.CREATED)
+        return challenge, session["session_id"], seed
+
+    def test_trusted_collector_challenge_is_issued(self) -> None:
+        status, challenge = self.store.create_attestation_challenge(
+            {"collector_id": "test-endpoint"}
+        )
+        self.assertEqual(status, HTTPStatus.CREATED)
+        self.assertEqual(len(challenge["challenge_id"]), 32)
+        self.assertEqual(len(challenge["nonce"]), 64)
+
+    def test_unregistered_collector_cannot_request_challenge(self) -> None:
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.create_attestation_challenge({"collector_id": "unknown"})
+        self.assertEqual(captured.exception.code, "collector_not_trusted")
+
+    def test_valid_attestation_is_anchored_to_session(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, self.mapped_digest
+        )
+        status, _ = self.store.append_batch(
+            session_id, batch_request(seed, records)
+        )
+        self.assertEqual(status, HTTPStatus.ACCEPTED)
+        state = self.store.session_status(session_id)
+        self.assertTrue(state["attestation_required"])
+        self.assertTrue(state["attestation_verified"])
+        self.assertEqual(
+            state["attestation_challenge_id"], challenge["challenge_id"]
+        )
+
+    def test_invalid_nonce_response_is_rejected(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        records = make_attestation_records(
+            seed,
+            challenge,
+            self.file_digest,
+            self.mapped_digest,
+            response_override="f" * 64,
+        )
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_batch(session_id, batch_request(seed, records))
+        self.assertEqual(captured.exception.code, "collector_attestation_invalid")
+
+    def test_heartbeat_requires_verified_attestation(self) -> None:
+        _challenge, session_id, seed = self._challenge_and_session()
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_heartbeat(
+                session_id,
+                {
+                    "heartbeat_seq": 1,
+                    "last_batch_seq": 0,
+                    "last_event_seq": 0,
+                    "chain_head": seed,
+                },
+            )
+        self.assertEqual(captured.exception.code, "collector_attestation_required")
+
+    def test_challenge_cannot_be_replayed_across_sessions(self) -> None:
+        challenge, first_session, first_seed = self._challenge_and_session()
+        first_records = make_attestation_records(
+            first_seed, challenge, self.file_digest, self.mapped_digest
+        )
+        self.store.append_batch(
+            first_session, batch_request(first_seed, first_records)
+        )
+
+        second_seed = "4" * 64
+        _, second = self.store.create_session(
+            session_request(
+                second_seed,
+                client_session_id="b" * 32,
+                schema_version=5,
+            )
+        )
+        second_records = make_attestation_records(
+            second_seed, challenge, self.file_digest, self.mapped_digest
+        )
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_batch(
+                second["session_id"], batch_request(second_seed, second_records)
+            )
+        self.assertEqual(captured.exception.code, "collector_attestation_replayed")
 
 
 class SpoolTests(unittest.TestCase):

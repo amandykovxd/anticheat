@@ -437,6 +437,20 @@ Production requirements:
 - target Windows compatibility tests;
 - install, upgrade, rollback, and uninstall tests.
 
+Repository automation:
+
+- `driver-submission.yml` creates an EV-signed Partner Center CAB on the
+  protected `driver-signing` runner;
+- `Test-MicrosoftSignedDriver.ps1` validates the returned kernel-policy and
+  catalog signatures and records SHA-256 evidence;
+- `driver-verifier.yml` manages one-boot standard verification for
+  `AcTelemetry.sys` on a disposable test VM;
+- `hlk-qualification.yml` runs an integrator PDEF on an HLK Controller and
+  retains the `.hlkx` package.
+
+None of these paths export a private key. The GitHub-hosted WDK build remains
+explicitly unsigned and is not a deployment artifact.
+
 ## Driver API exclusions
 
 The protocol intentionally has no operation for:

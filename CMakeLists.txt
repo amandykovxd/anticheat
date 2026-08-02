@@ -82,6 +82,7 @@ endif()
 install(
     PROGRAMS
         tools/reference_receiver.py
+        tools/request_attestation_challenge.py
         tools/telemetry_shipper.py
         tools/transport_common.py
         tools/verify_log.py
@@ -177,6 +178,17 @@ if(UNIX AND NOT APPLE)
                 linux.suspicious_executable_mapping
                 PROPERTIES LABELS "linux;integration" TIMEOUT 30
             )
+            add_test(
+                NAME linux.process_vm_audit
+                COMMAND
+                    ${Python3_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_linux_audit_fixture.py"
+                    --collector $<TARGET_FILE:anticheat>
+            )
+            set_tests_properties(
+                linux.process_vm_audit
+                PROPERTIES LABELS "linux;integration;audit" TIMEOUT 30
+            )
         endif()
         set_tests_properties(
             linux.cli.version linux.cli.help linux.live_self_scan
@@ -185,7 +197,12 @@ if(UNIX AND NOT APPLE)
     endif()
 
     install(TARGETS anticheat RUNTIME DESTINATION bin)
-    install(PROGRAMS tools/linux_suspicious_fixture.py DESTINATION tools)
+    install(
+        PROGRAMS
+            tools/linux_suspicious_fixture.py
+            tools/install_linux_audit_rules.sh
+        DESTINATION tools
+    )
     return()
 endif()
 
@@ -197,6 +214,7 @@ if(NOT WIN32)
 endif()
 
 add_library(anticheat_core STATIC
+    src/attestation.c
     src/integrity.c
     src/kernel_client.c
     src/log.c
@@ -250,6 +268,9 @@ if(BUILD_TESTING)
         kernel_drop_counter
         kernel_user_correlation
         kernel_thread_correlation
+        attestation_current_image
+        attestation_nonce_binding
+        attestation_invalid
         dispatch_watch_pointer
         dispatch_watch_vtable
         dispatch_watch_invalid
@@ -260,6 +281,7 @@ if(BUILD_TESTING)
         threat_process_indicators
         threat_device_indicators
         threat_posture_classification
+        runtime_kernel_posture
         threat_overlay_classification
     )
     foreach(test_case IN LISTS AC_CORE_TEST_CASES)

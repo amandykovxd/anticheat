@@ -99,8 +99,8 @@ jobs:
               Out-String |
               ConvertFrom-Json
           )
-          if ($inventory.tests.Count -ne 52) {
-            throw "Expected 52 independent tests, found $($inventory.tests.Count)"
+          if ($inventory.tests.Count -ne 56) {
+            throw "Expected 56 independent tests, found $($inventory.tests.Count)"
           }
 
       - name: Test
@@ -222,7 +222,7 @@ jobs:
       - name: Verify automated test inventory
         run: |
           count=$(ctest --test-dir out/build/linux -N | sed -n 's/^Total Tests: //p')
-          test "$count" = 22
+          test "$count" = 23
 
       - name: Test
         run: ctest --test-dir out/build/linux --output-on-failure

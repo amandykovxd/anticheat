@@ -125,6 +125,32 @@ collector file cannot be identified, `collector_identity_unavailable` is emitted
 at `medium`. This is an identity signal, not in-process attestation; a server
 nonce remains necessary against collector-process compromise.
 
+### `collector_attestation_observed`
+
+Severity: `info` for a complete matching image, `high` for a mismatch.
+
+Fields:
+
+- `scan_id`;
+- `challenge_id`: 32-character server challenge identifier;
+- `nonce_sha256`: digest of the nonce; the nonce itself is never logged;
+- `file_sha256`;
+- `expected_mapped_sha256`;
+- `observed_mapped_sha256`;
+- `response_sha256`;
+- `executable_sections` and `executable_bytes`;
+- `mapped_matches_disk`;
+- `complete`;
+- `normalization`: `pe_relocations_iat_unbacked_masked_v1`.
+
+The response is
+`SHA256("ac-collector-attestation-v1" || challenge_id || nonce ||
+file_sha256 || observed_mapped_sha256)`, where all values after the domain are
+decoded bytes. The reference receiver compares file and normalized mapped
+digests to its configured signed-release identity and consumes each challenge
+for one session. This remains software attestation and does not survive a
+fully hostile kernel.
+
 ### `waiting_for_process`
 
 Severity: `info`.
@@ -354,6 +380,28 @@ Values are `enabled`, `disabled`, or `unknown`. Registry absence is reported
 as `unknown`; the collector does not infer active boot state from a missing
 value. An explicitly disabled vulnerable-driver blocklist is `high`. Disabled
 HVCI or VBS is `medium`. This event is not an enforcement decision.
+
+### `kernel_runtime_trust_posture`
+
+Severity: `info` when the strict runtime policy is satisfied, otherwise
+`high`.
+
+Fields:
+
+- `query_complete`;
+- `secure_boot`;
+- `code_integrity_options`;
+- `code_integrity_enabled`;
+- `test_signing_allowed`;
+- `debug_mode_enabled`;
+- `hvci_kernel_enforced`;
+- `secure_kernel_policy_satisfied`;
+- `source_trust`: `local_kernel_reported`.
+
+`--require-secure-kernel` fails closed unless Secure Boot, kernel Code
+Integrity, and kernel HVCI enforcement are active and test-signing and debug
+modes are absent. The values are local posture evidence, not remote hardware
+attestation.
 
 ### `known_threat_indicator_observed`
 
@@ -713,11 +761,16 @@ The Linux procfs collector emits:
 - `linux_target_traced`;
 - `linux_foreign_target_mem_open`;
 - `linux_uinput_owner_observed`;
+- `linux_kernel_audit_connected`;
+- `linux_process_vm_access_observed`;
+- `linux_kernel_audit_lost`;
 - `linux_kernel_audit_unavailable`.
 
-`linux_kernel_audit_unavailable` is a capability gap: procfs cannot identify
-callers of `process_vm_readv` or `process_vm_writev`. An eBPF LSM or audit
-integration is required for those operations.
+`linux_process_vm_access_observed` contains `scan_id`, `actor_pid`, operation,
+success state, executable, source `linux_audit`, and verdict `signal_only`.
+Successful `process_vm_writev` is `high`; reads and failed attempts are
+`medium`. `linux_kernel_audit_unavailable` is a capability gap: procfs alone
+cannot identify callers of these system calls.
 
 ### `module_file_identity_changed`
 

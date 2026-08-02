@@ -40,6 +40,10 @@ MAX_BATCH_RECORDS = 512
 SESSION_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})$")
 BATCH_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/batches$")
 HEARTBEAT_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/heartbeat$")
+ATTESTATION_CHALLENGE_PATH = "/v1/attestations/challenges"
+ATTESTATION_DOMAIN = b"ac-collector-attestation-v1"
+ATTESTATION_CHALLENGE_BYTES = 16
+ATTESTATION_NONCE_BYTES = 32
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -74,9 +78,17 @@ def _now_ms() -> int:
 class ReceiverStore:
     """SQLite-backed append-only session, batch, and heartbeat state."""
 
-    def __init__(self, database: str | Path, heartbeat_interval_ms: int = 15_000):
+    def __init__(
+        self,
+        database: str | Path,
+        heartbeat_interval_ms: int = 15_000,
+        trusted_collectors: dict[str, tuple[str, str]] | None = None,
+        attestation_ttl_ms: int = 300_000,
+    ):
         self.database = str(database)
         self.heartbeat_interval_ms = heartbeat_interval_ms
+        self.trusted_collectors = trusted_collectors or {}
+        self.attestation_ttl_ms = attestation_ttl_ms
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -107,6 +119,8 @@ class ReceiverStore:
                     last_event_seq INTEGER NOT NULL DEFAULT 0,
                     last_batch_seq INTEGER NOT NULL DEFAULT 0,
                     last_heartbeat_seq INTEGER NOT NULL DEFAULT 0,
+                    attestation_verified INTEGER NOT NULL DEFAULT 0,
+                    attestation_challenge_id TEXT,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 );
@@ -135,7 +149,195 @@ class ReceiverStore:
                     PRIMARY KEY (session_id, heartbeat_seq),
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
                 );
+                CREATE TABLE IF NOT EXISTS attestation_challenges (
+                    challenge_id TEXT PRIMARY KEY,
+                    collector_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    consumed_session_id TEXT,
+                    validated_at_ms INTEGER,
+                    created_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY (consumed_session_id) REFERENCES sessions(session_id)
+                );
                 """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "attestation_verified" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN attestation_verified "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "attestation_challenge_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN attestation_challenge_id TEXT"
+                )
+
+    def create_attestation_challenge(
+        self, request: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            collector_id = require_string(
+                request.get("collector_id"), "collector_id", 255
+            )
+        except ProtocolError as error:
+            raise ReceiverError(
+                HTTPStatus.BAD_REQUEST, "request_invalid", str(error)
+            ) from error
+        if collector_id not in self.trusted_collectors:
+            raise ReceiverError(
+                HTTPStatus.FORBIDDEN,
+                "collector_not_trusted",
+                "collector identity is not registered for attestation",
+            )
+
+        now = _now_ms()
+        challenge_id = secrets.token_hex(ATTESTATION_CHALLENGE_BYTES)
+        nonce = secrets.token_hex(ATTESTATION_NONCE_BYTES)
+        expires_at_ms = now + self.attestation_ttl_ms
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO attestation_challenges (
+                    challenge_id, collector_id, nonce, expires_at_ms, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (challenge_id, collector_id, nonce, expires_at_ms, now),
+            )
+        return HTTPStatus.CREATED, {
+            "challenge_id": challenge_id,
+            "nonce": nonce,
+            "expires_at_ms": expires_at_ms,
+            "algorithm": "sha256",
+        }
+
+    def _validate_attestations(
+        self,
+        connection: sqlite3.Connection,
+        session: sqlite3.Row,
+        records: list[Any],
+        now: int,
+    ) -> None:
+        trusted = self.trusted_collectors.get(session["collector_id"])
+        if trusted is None:
+            return
+
+        for record in records:
+            if record.event != "collector_attestation_observed":
+                continue
+            try:
+                details = record.document.get("details")
+                if not isinstance(details, dict):
+                    raise ProtocolError("attestation details must be an object")
+                challenge_id = require_string(
+                    details.get("challenge_id"), "details.challenge_id", 32
+                )
+                if (
+                    len(challenge_id) != ATTESTATION_CHALLENGE_BYTES * 2
+                    or challenge_id.lower() != challenge_id
+                ):
+                    raise ProtocolError("details.challenge_id has an invalid format")
+                try:
+                    bytes.fromhex(challenge_id)
+                except ValueError as error:
+                    raise ProtocolError(
+                        "details.challenge_id has an invalid format"
+                    ) from error
+                nonce_sha256 = require_sha256(
+                    details.get("nonce_sha256"), "details.nonce_sha256"
+                )
+                file_sha256 = require_sha256(
+                    details.get("file_sha256"), "details.file_sha256"
+                )
+                expected_mapped = require_sha256(
+                    details.get("expected_mapped_sha256"),
+                    "details.expected_mapped_sha256",
+                )
+                observed_mapped = require_sha256(
+                    details.get("observed_mapped_sha256"),
+                    "details.observed_mapped_sha256",
+                )
+                response_sha256 = require_sha256(
+                    details.get("response_sha256"), "details.response_sha256"
+                )
+                if details.get("mapped_matches_disk") is not True:
+                    raise ProtocolError("mapped collector image does not match disk")
+                if details.get("complete") is not True:
+                    raise ProtocolError("collector attestation is incomplete")
+            except ProtocolError as error:
+                raise ReceiverError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "collector_attestation_invalid",
+                    str(error),
+                ) from error
+
+            challenge = connection.execute(
+                "SELECT * FROM attestation_challenges WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if challenge is None or challenge["collector_id"] != session["collector_id"]:
+                raise ReceiverError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "collector_attestation_invalid",
+                    "attestation challenge is unknown for this collector",
+                )
+            consumed = challenge["consumed_session_id"]
+            if challenge["expires_at_ms"] < now and consumed is None:
+                raise ReceiverError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "collector_attestation_expired",
+                    "attestation challenge has expired",
+                )
+            if consumed is not None and consumed != session["session_id"]:
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "collector_attestation_replayed",
+                    "attestation challenge was consumed by another session",
+                )
+
+            trusted_file, trusted_mapped = trusted
+            expected_nonce_digest = hashlib.sha256(
+                bytes.fromhex(challenge["nonce"])
+            ).hexdigest()
+            expected_response = hashlib.sha256(
+                ATTESTATION_DOMAIN
+                + bytes.fromhex(challenge_id)
+                + bytes.fromhex(challenge["nonce"])
+                + bytes.fromhex(file_sha256)
+                + bytes.fromhex(observed_mapped)
+            ).hexdigest()
+            identity_matches = (
+                hmac.compare_digest(file_sha256, trusted_file)
+                and hmac.compare_digest(expected_mapped, trusted_mapped)
+                and hmac.compare_digest(observed_mapped, trusted_mapped)
+                and hmac.compare_digest(expected_mapped, observed_mapped)
+                and hmac.compare_digest(nonce_sha256, expected_nonce_digest)
+                and hmac.compare_digest(response_sha256, expected_response)
+            )
+            if not identity_matches:
+                raise ReceiverError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "collector_attestation_invalid",
+                    "collector identity or nonce response is invalid",
+                )
+
+            connection.execute(
+                """
+                UPDATE attestation_challenges
+                   SET consumed_session_id = ?, validated_at_ms = ?
+                 WHERE challenge_id = ?
+                """,
+                (session["session_id"], now, challenge_id),
+            )
+            connection.execute(
+                """
+                UPDATE sessions
+                   SET attestation_verified = 1, attestation_challenge_id = ?
+                 WHERE session_id = ?
+                """,
+                (challenge_id, session["session_id"]),
             )
 
     @staticmethod
@@ -364,6 +566,8 @@ class ReceiverStore:
                     "chain_head does not match the retained records",
                 )
 
+            self._validate_attestations(connection, session, verified, now)
+
             connection.execute(
                 """
                 INSERT INTO batches (
@@ -428,6 +632,15 @@ class ReceiverStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             session = self._load_session(connection, session_id)
+            if (
+                session["collector_id"] in self.trusted_collectors
+                and session["attestation_verified"] != 1
+            ):
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "collector_attestation_required",
+                    "a verified collector attestation must be anchored before heartbeat",
+                )
             duplicate = connection.execute(
                 """
                 SELECT request_sha256 FROM heartbeats
@@ -517,6 +730,9 @@ class ReceiverStore:
                 "last_heartbeat_seq": row["last_heartbeat_seq"],
                 "chain_head": row["chain_head"],
                 "updated_at_ms": row["updated_at_ms"],
+                "attestation_required": row["collector_id"] in self.trusted_collectors,
+                "attestation_verified": bool(row["attestation_verified"]),
+                "attestation_challenge_id": row["attestation_challenge_id"],
             }
 
 
@@ -637,7 +853,11 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             request = self._read_request()
-            if self.path == "/v1/sessions":
+            if self.path == ATTESTATION_CHALLENGE_PATH:
+                status, response = self.server.store.create_attestation_challenge(
+                    request
+                )
+            elif self.path == "/v1/sessions":
                 status, response = self.server.store.create_session(request)
             else:
                 batch_match = BATCH_PATH.fullmatch(self.path)
@@ -669,6 +889,14 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--client-ca", help="PEM CA used to require client certificates")
     parser.add_argument("--token-env", default="AC_RECEIVER_TOKEN")
     parser.add_argument("--heartbeat-ms", type=int, default=15_000)
+    parser.add_argument("--attestation-ttl-ms", type=int, default=300_000)
+    parser.add_argument(
+        "--trusted-collector",
+        action="append",
+        default=[],
+        metavar="ID:FILE_SHA256:MAPPED_SHA256",
+        help="trusted collector identity; may be repeated",
+    )
     parser.add_argument(
         "--allow-insecure-http",
         action="store_true",
@@ -689,6 +917,9 @@ def main() -> int:
     if not 1_000 <= arguments.heartbeat_ms <= 3_600_000:
         print("--heartbeat-ms must be between 1000 and 3600000", file=sys.stderr)
         return 2
+    if not 10_000 <= arguments.attestation_ttl_ms <= 3_600_000:
+        print("--attestation-ttl-ms must be between 10000 and 3600000", file=sys.stderr)
+        return 2
     if bool(arguments.cert) != bool(arguments.key):
         print("--cert and --key must be supplied together", file=sys.stderr)
         return 2
@@ -696,7 +927,26 @@ def main() -> int:
         print("TLS is required; supply --cert and --key", file=sys.stderr)
         return 2
 
-    store = ReceiverStore(arguments.database, arguments.heartbeat_ms)
+    trusted_collectors: dict[str, tuple[str, str]] = {}
+    try:
+        for value in arguments.trusted_collector:
+            collector_id, file_digest, mapped_digest = value.split(":", 2)
+            if not collector_id or collector_id in trusted_collectors:
+                raise ValueError("collector ID is empty or duplicated")
+            trusted_collectors[collector_id] = (
+                require_sha256(file_digest, "file SHA-256"),
+                require_sha256(mapped_digest, "mapped SHA-256"),
+            )
+    except (ValueError, ProtocolError) as error:
+        print(f"invalid --trusted-collector: {error}", file=sys.stderr)
+        return 2
+
+    store = ReceiverStore(
+        arguments.database,
+        arguments.heartbeat_ms,
+        trusted_collectors,
+        arguments.attestation_ttl_ms,
+    )
     server = ReceiverHttpServer((arguments.listen, arguments.port), store, token)
     if arguments.cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

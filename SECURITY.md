@@ -209,6 +209,13 @@ transition and persists the accepted chain head under a server-issued session
 identifier. Production deployments must protect receiver storage against
 operator rollback and monitor missing heartbeat intervals.
 
+For registered release identities, the receiver also issues a short-lived
+nonce and validates `collector_attestation_observed` before accepting
+heartbeat. This detects stale responses, a collector binary different from the
+configured release, and mapped executable-section modification at the time of
+measurement. It is not hardware attestation: hostile kernel code can falsify
+the process view or execute the measurement in a clean surrogate process.
+
 ## Driver signing and deployment
 
 Development builds must be test-signed and loaded only on isolated test
@@ -223,8 +230,13 @@ systems. Production distribution requires:
 - crash-dump collection and symbol retention;
 - applicable Microsoft driver signing or certification.
 
-The repository does not contain a production certificate, private key, or
-automatic signing configuration.
+The `driver-submission` workflow builds an Inf2Cat package and EV-signs a
+Partner Center submission CAB on a protected self-hosted runner. Private keys
+remain in the runner certificate store. A submission CAB is not production
+deployable; only the Microsoft-returned package that passes
+`Test-MicrosoftSignedDriver.ps1` is eligible for release. Driver Verifier and
+HLK workflows require dedicated self-hosted lab environments and retain result
+evidence as CI artifacts.
 
 ## Data inventory
 

@@ -214,6 +214,28 @@ static void test_threat_posture_classification(void)
         AC_CONFIGURED_UNKNOWN) == AC_SEVERITY_INFO);
 }
 
+static void test_runtime_kernel_posture_classification(void)
+{
+    AcRuntimeKernelPosture posture;
+
+    memset(&posture, 0, sizeof(posture));
+    posture.query_complete = true;
+    posture.secure_boot = AC_CONFIGURED_ENABLED;
+    posture.code_integrity_enabled = true;
+    posture.hvci_kernel_enforced = true;
+    AC_CHECK(ac_runtime_kernel_posture_secure(&posture));
+
+    posture.test_signing_allowed = true;
+    AC_CHECK(!ac_runtime_kernel_posture_secure(&posture));
+    posture.test_signing_allowed = false;
+    posture.debug_mode_enabled = true;
+    AC_CHECK(!ac_runtime_kernel_posture_secure(&posture));
+    posture.debug_mode_enabled = false;
+    posture.secure_boot = AC_CONFIGURED_UNKNOWN;
+    AC_CHECK(!ac_runtime_kernel_posture_secure(&posture));
+    AC_CHECK(!ac_runtime_kernel_posture_secure(NULL));
+}
+
 static void test_threat_overlay_classification(void)
 {
     AcOverlayFeatures features;
@@ -1292,6 +1314,61 @@ static void test_kernel_thread_start_correlation(void)
     (void)_wremove(path);
 }
 
+static void test_collector_attestation_current_image(void)
+{
+    AcCollectorAttestation result;
+
+    AC_CHECK(ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        &result));
+    AC_CHECK(result.complete);
+    AC_CHECK(result.mapped_matches_disk);
+    AC_CHECK(result.executable_sections > 0u);
+    AC_CHECK(result.executable_bytes > 0u);
+    AC_CHECK(strlen(result.file_sha256) == 64u);
+    AC_CHECK(strlen(result.expected_mapped_sha256) == 64u);
+    AC_CHECK(strcmp(
+        result.expected_mapped_sha256,
+        result.observed_mapped_sha256) == 0);
+    AC_CHECK(strlen(result.response_sha256) == 64u);
+}
+
+static void test_collector_attestation_nonce_binding(void)
+{
+    AcCollectorAttestation first;
+    AcCollectorAttestation second;
+
+    AC_CHECK(ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        &first));
+    AC_CHECK(ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"100102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        &second));
+    AC_CHECK(strcmp(first.file_sha256, second.file_sha256) == 0);
+    AC_CHECK(strcmp(
+        first.expected_mapped_sha256,
+        second.expected_mapped_sha256) == 0);
+    AC_CHECK(strcmp(first.nonce_sha256, second.nonce_sha256) != 0);
+    AC_CHECK(strcmp(first.response_sha256, second.response_sha256) != 0);
+}
+
+static void test_collector_attestation_rejects_invalid_challenge(void)
+{
+    AcCollectorAttestation result;
+
+    AC_CHECK(!ac_collector_attest(
+        L"short",
+        L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        &result));
+    AC_CHECK(!ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        &result));
+}
+
 typedef void (*AcCoreTestFunction)(void);
 
 typedef struct AcCoreTestCase {
@@ -1320,6 +1397,9 @@ static const AcCoreTestCase g_test_cases[] = {
     {"kernel_drop_counter", test_kernel_drop_counter_is_monotonic},
     {"kernel_user_correlation", test_kernel_user_module_correlation},
     {"kernel_thread_correlation", test_kernel_thread_start_correlation},
+    {"attestation_current_image", test_collector_attestation_current_image},
+    {"attestation_nonce_binding", test_collector_attestation_nonce_binding},
+    {"attestation_invalid", test_collector_attestation_rejects_invalid_challenge},
     {"dispatch_watch_pointer", test_dispatch_watch_pointer_parse},
     {"dispatch_watch_vtable", test_dispatch_watch_vtable_parse},
     {"dispatch_watch_invalid", test_dispatch_watch_rejects_invalid_specs},
@@ -1330,6 +1410,7 @@ static const AcCoreTestCase g_test_cases[] = {
     {"threat_process_indicators", test_threat_process_indicators},
     {"threat_device_indicators", test_threat_device_indicators},
     {"threat_posture_classification", test_threat_posture_classification},
+    {"runtime_kernel_posture", test_runtime_kernel_posture_classification},
     {"threat_overlay_classification", test_threat_overlay_classification}
 };
 

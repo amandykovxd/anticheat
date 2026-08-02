@@ -21,6 +21,22 @@
 #define AC_DRIVER_SNAPSHOT_INITIAL 256u
 #define AC_DRIVER_SNAPSHOT_MAX 4096u
 #define AC_STATUS_NO_MORE_ENTRIES ((LONG)0x8000001aL)
+#define AC_SYSTEM_CODE_INTEGRITY_INFORMATION 103u
+#define AC_CI_OPTION_ENABLED 0x00000001u
+#define AC_CI_OPTION_TESTSIGN 0x00000002u
+#define AC_CI_OPTION_DEBUGMODE_ENABLED 0x00000080u
+#define AC_CI_OPTION_HVCI_KMCI_ENABLED 0x00000400u
+
+typedef struct AcSystemCodeIntegrityInformation {
+    ULONG length;
+    ULONG options;
+} AcSystemCodeIntegrityInformation;
+
+typedef NTSTATUS (NTAPI *AcNtQuerySystemInformationFn)(
+    ULONG information_class,
+    PVOID information,
+    ULONG information_length,
+    PULONG return_length);
 
 typedef struct AcObjectDirectoryInformation {
     UNICODE_STRING name;
@@ -154,6 +170,103 @@ AcSeverity ac_security_posture_severity(
         return AC_SEVERITY_LOW;
     }
     return AC_SEVERITY_INFO;
+}
+
+bool ac_query_runtime_kernel_posture(AcRuntimeKernelPosture *posture)
+{
+    HMODULE ntdll;
+    AcNtQuerySystemInformationFn query;
+    AcSystemCodeIntegrityInformation information;
+    NTSTATUS status;
+
+    if (posture == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    memset(posture, 0, sizeof(*posture));
+    posture->secure_boot = ac_read_configured_dword(
+        L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+        L"UEFISecureBootEnabled");
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) {
+        return false;
+    }
+    query = (AcNtQuerySystemInformationFn)(uintptr_t)GetProcAddress(
+        ntdll, "NtQuerySystemInformation");
+    if (query == NULL) {
+        return false;
+    }
+    memset(&information, 0, sizeof(information));
+    information.length = (ULONG)sizeof(information);
+    status = query(
+        AC_SYSTEM_CODE_INTEGRITY_INFORMATION,
+        &information,
+        (ULONG)sizeof(information),
+        NULL);
+    if (status < 0) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+
+    posture->code_integrity_options = information.options;
+    posture->code_integrity_enabled =
+        (information.options & AC_CI_OPTION_ENABLED) != 0u;
+    posture->test_signing_allowed =
+        (information.options & AC_CI_OPTION_TESTSIGN) != 0u;
+    posture->debug_mode_enabled =
+        (information.options & AC_CI_OPTION_DEBUGMODE_ENABLED) != 0u;
+    posture->hvci_kernel_enforced =
+        (information.options & AC_CI_OPTION_HVCI_KMCI_ENABLED) != 0u;
+    posture->query_complete = true;
+    return true;
+}
+
+bool ac_runtime_kernel_posture_secure(const AcRuntimeKernelPosture *posture)
+{
+    return posture != NULL &&
+           posture->query_complete &&
+           posture->secure_boot == AC_CONFIGURED_ENABLED &&
+           posture->code_integrity_enabled &&
+           posture->hvci_kernel_enforced &&
+           !posture->test_signing_allowed &&
+           !posture->debug_mode_enabled;
+}
+
+void ac_log_runtime_kernel_posture(
+    AcLogger *logger,
+    DWORD target_pid,
+    const AcRuntimeKernelPosture *posture)
+{
+    char details[512];
+    bool secure;
+
+    if (logger == NULL || posture == NULL) {
+        return;
+    }
+    secure = ac_runtime_kernel_posture_secure(posture);
+    (void)snprintf(
+        details,
+        sizeof(details),
+        "{\"query_complete\":%s,\"secure_boot\":\"%s\","
+        "\"code_integrity_options\":\"0x%08" PRIx32 "\","
+        "\"code_integrity_enabled\":%s,\"test_signing_allowed\":%s,"
+        "\"debug_mode_enabled\":%s,\"hvci_kernel_enforced\":%s,"
+        "\"secure_kernel_policy_satisfied\":%s,"
+        "\"source_trust\":\"local_kernel_reported\"}",
+        posture->query_complete ? "true" : "false",
+        ac_configured_state_name(posture->secure_boot),
+        posture->code_integrity_options,
+        posture->code_integrity_enabled ? "true" : "false",
+        posture->test_signing_allowed ? "true" : "false",
+        posture->debug_mode_enabled ? "true" : "false",
+        posture->hvci_kernel_enforced ? "true" : "false",
+        secure ? "true" : "false");
+    ac_log_event(
+        logger,
+        secure ? AC_SEVERITY_INFO : AC_SEVERITY_HIGH,
+        "kernel_runtime_trust_posture",
+        target_pid,
+        details);
 }
 
 bool ac_overlay_features_suspicious(const AcOverlayFeatures *features)

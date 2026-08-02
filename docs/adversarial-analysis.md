@@ -296,7 +296,13 @@ Ranked by attacker cost imposed per unit of engineering effort:
 | 6 | Risk-ordered integrity cursor | C4 | — |
 | 7 | Dispatch-metadata validation | C5 | configured pointer/VMT watches implemented |
 
-Collector nonce attestation and risk-ordered integrity scheduling remain open.
+Collector nonce attestation is implemented as a server-issued, short-lived
+challenge bound to the signed release file digest and normalized mapped-image
+digest. It raises the cost of patching the active collector and prevents
+cross-session challenge replay. It does not establish a hardware root of trust:
+a hostile kernel can redirect reads, hide executable mappings, or run the
+measurement in a clean surrogate. Risk-ordered integrity scheduling remains a
+separate control.
 
 No item in this table makes user-mode detection unevadable. They raise the cost
 from "one afternoon" to "sustained engineering", which is the only honest goal

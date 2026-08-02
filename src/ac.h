@@ -36,6 +36,9 @@
 #define AC_THREAT_DEDUP_CAPACITY 256u
 #define AC_MAX_DISPATCH_WATCHES 64u
 #define AC_MAX_VTABLE_ENTRIES 64u
+#define AC_ATTESTATION_CHALLENGE_BYTES 16u
+#define AC_ATTESTATION_CHALLENGE_HEX_SIZE \
+    (AC_ATTESTATION_CHALLENGE_BYTES * 2u + 1u)
 
 typedef enum AcSeverity {
     AC_SEVERITY_INFO,
@@ -59,6 +62,19 @@ typedef struct AcLogger {
     uint64_t write_failures;
     uint8_t chain[AC_SHA256_DIGEST_SIZE];
 } AcLogger;
+
+typedef struct AcCollectorAttestation {
+    char challenge_id[AC_ATTESTATION_CHALLENGE_HEX_SIZE];
+    char nonce_sha256[AC_SHA256_HEX_SIZE];
+    char file_sha256[AC_SHA256_HEX_SIZE];
+    char expected_mapped_sha256[AC_SHA256_HEX_SIZE];
+    char observed_mapped_sha256[AC_SHA256_HEX_SIZE];
+    char response_sha256[AC_SHA256_HEX_SIZE];
+    size_t executable_sections;
+    uint64_t executable_bytes;
+    bool mapped_matches_disk;
+    bool complete;
+} AcCollectorAttestation;
 
 typedef struct AcModule {
     uintptr_t base;
@@ -210,6 +226,16 @@ typedef enum AcConfiguredState {
     AC_CONFIGURED_ENABLED = 1
 } AcConfiguredState;
 
+typedef struct AcRuntimeKernelPosture {
+    uint32_t code_integrity_options;
+    AcConfiguredState secure_boot;
+    bool query_complete;
+    bool code_integrity_enabled;
+    bool test_signing_allowed;
+    bool debug_mode_enabled;
+    bool hvci_kernel_enforced;
+} AcRuntimeKernelPosture;
+
 typedef struct AcOverlayFeatures {
     bool topmost;
     bool transparent;
@@ -303,6 +329,16 @@ void ac_log_win32_error_severity(
     DWORD pid,
     DWORD error_code);
 
+bool ac_collector_attest(
+    const wchar_t *challenge_id,
+    const wchar_t *nonce,
+    AcCollectorAttestation *result);
+void ac_log_collector_attestation(
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t scan_id,
+    const AcCollectorAttestation *result);
+
 bool ac_find_process_by_name(
     const wchar_t *name,
     DWORD *pid_out,
@@ -324,6 +360,12 @@ AcSeverity ac_security_posture_severity(
     AcConfiguredState hvci,
     AcConfiguredState vbs,
     AcConfiguredState run_as_ppl);
+bool ac_query_runtime_kernel_posture(AcRuntimeKernelPosture *posture);
+bool ac_runtime_kernel_posture_secure(const AcRuntimeKernelPosture *posture);
+void ac_log_runtime_kernel_posture(
+    AcLogger *logger,
+    DWORD target_pid,
+    const AcRuntimeKernelPosture *posture);
 bool ac_overlay_features_suspicious(const AcOverlayFeatures *features);
 bool ac_threat_sensor_init(AcThreatSensor *sensor, uint64_t repeat_interval_ms);
 void ac_threat_sensor_free(AcThreatSensor *sensor);
