@@ -480,8 +480,10 @@ static bool ac_integrity_build_baseline(
 
         ac_pe_mask_finalize(&baseline->mask);
 
-        block_count = (section->virtual_size + AC_INTEGRITY_BLOCK_SIZE - 1u) /
-                      AC_INTEGRITY_BLOCK_SIZE;
+        block_count = section->virtual_size / AC_INTEGRITY_BLOCK_SIZE;
+        if (section->virtual_size % AC_INTEGRITY_BLOCK_SIZE != 0) {
+            ++block_count;
+        }
         target = &baseline->sections[baseline->section_count];
         memcpy(target->name, section->name, AC_PE_SECTION_NAME_SIZE);
         target->rva = section->virtual_address;
@@ -497,8 +499,16 @@ static bool ac_integrity_build_baseline(
 
         for (block = 0; block < block_count; ++block) {
             const uint32_t offset = block * AC_INTEGRITY_BLOCK_SIZE;
-            const uint32_t length = section->virtual_size - offset < AC_INTEGRITY_BLOCK_SIZE
-                ? section->virtual_size - offset
+            uint32_t remaining;
+            uint32_t length;
+
+            if (offset >= section->virtual_size) {
+                ok = false;
+                break;
+            }
+            remaining = section->virtual_size - offset;
+            length = remaining < AC_INTEGRITY_BLOCK_SIZE
+                ? remaining
                 : AC_INTEGRITY_BLOCK_SIZE;
 
             memcpy(context->integrity_expected, materialized + offset, length);
@@ -511,6 +521,13 @@ static bool ac_integrity_build_baseline(
                 context->integrity_expected,
                 length,
                 target->block_hashes + (size_t)block * AC_SHA256_DIGEST_SIZE);
+        }
+
+        if (!ok) {
+            free(target->block_hashes);
+            target->block_hashes = NULL;
+            free(materialized);
+            break;
         }
 
         baseline->allocated_bytes +=
