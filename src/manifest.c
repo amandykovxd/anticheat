@@ -241,30 +241,27 @@ bool ac_manifest_load_pinned(
         char *digest_text;
         char *file_name;
         char *extra;
-        char *cursor = line;
         const size_t length = strlen(line);
+        const size_t offset = strspn(line, " \t");
 
         if (length == sizeof(line) - 1u && line[length - 1u] != '\n') {
             goto fail;
         }
-        while (*cursor == ' ' || *cursor == '\t') {
-            ++cursor;
-        }
-        if (*cursor == '\0' || *cursor == '\r' || *cursor == '\n' ||
-            *cursor == '#') {
+        if (offset >= length || line[offset] == '\r' ||
+            line[offset] == '\n' || line[offset] == '#') {
             continue;
         }
-        cursor[strcspn(cursor, "\r\n")] = '\0';
+        line[offset + strcspn(line + offset, "\r\n")] = '\0';
 
         if (!header_seen) {
-            if (strcmp(cursor, "ac-manifest-v1") != 0) {
+            if (strcmp(line + offset, "ac-manifest-v1") != 0) {
                 goto fail;
             }
             header_seen = true;
             continue;
         }
 
-        kind_text = strtok_s(cursor, " \t", &context);
+        kind_text = strtok_s(line + offset, " \t", &context);
         digest_text = strtok_s(NULL, " \t", &context);
         file_name = strtok_s(NULL, " \t", &context);
         extra = strtok_s(NULL, " \t", &context);

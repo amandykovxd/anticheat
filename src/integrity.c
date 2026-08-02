@@ -351,6 +351,11 @@ static bool ac_integrity_collect_iat_slot(void *user, uint32_t slot_rva, bool de
         collector->capacity = capacity;
     }
 
+    if (collector->slots == NULL || collector->delay_flags == NULL ||
+        collector->count >= collector->capacity) {
+        collector->failed = true;
+        return false;
+    }
     collector->slots[collector->count] = slot_rva;
     collector->delay_flags[collector->count] = delay_load ? 1u : 0u;
     ++collector->count;
