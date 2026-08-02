@@ -558,17 +558,23 @@ int ac_test_patch_victim(int value)
 
 typedef struct AcIntegrityFixture {
     AcLogger logger;
-    AcContext context;
-    AcPolicy policy;
+    AcContext *context;
+    AcPolicy *policy;
     AcTarget target;
     wchar_t log_path[MAX_PATH];
     wchar_t windows_directory[MAX_PATH];
-    bool ready;
+    bool logger_ready;
+    bool context_ready;
 } AcIntegrityFixture;
 
 static bool ac_test_integrity_setup(AcIntegrityFixture *fixture, const wchar_t *stem)
 {
     memset(fixture, 0, sizeof(*fixture));
+    fixture->context = (AcContext *)calloc(1u, sizeof(*fixture->context));
+    fixture->policy = (AcPolicy *)calloc(1u, sizeof(*fixture->policy));
+    if (fixture->context == NULL || fixture->policy == NULL) {
+        return false;
+    }
 
     if (!ac_temp_log_path(
             fixture->log_path,
@@ -597,30 +603,33 @@ static bool ac_test_integrity_setup(AcIntegrityFixture *fixture, const wchar_t *
         (UINT)(sizeof(fixture->windows_directory) /
                sizeof(fixture->windows_directory[0])));
 
-    ac_policy_init_defaults(&fixture->policy);
-    fixture->policy.allow_root_count = 2u;
-    fixture->policy.allow_roots[0] = fixture->target.directory;
-    fixture->policy.allow_roots[1] = fixture->windows_directory;
-    fixture->policy.integrity_budget_bytes = 256ull * 1024ull * 1024ull;
-    fixture->policy.probe_region_content = false;
-    fixture->policy.hash_unknown_modules = false;
-    fixture->policy.repeat_interval_ms = 0;
+    ac_policy_init_defaults(fixture->policy);
+    fixture->policy->allow_root_count = 2u;
+    fixture->policy->allow_roots[0] = fixture->target.directory;
+    fixture->policy->allow_roots[1] = fixture->windows_directory;
+    fixture->policy->integrity_budget_bytes = 256ull * 1024ull * 1024ull;
+    fixture->policy->probe_region_content = false;
+    fixture->policy->hash_unknown_modules = false;
+    fixture->policy->repeat_interval_ms = 0;
 
     if (!ac_logger_open(&fixture->logger, fixture->log_path, false, 0, 0)) {
         return false;
     }
-    if (!ac_context_init(&fixture->context, &fixture->logger, &fixture->policy)) {
+    fixture->logger_ready = true;
+    if (!ac_context_init(fixture->context, &fixture->logger, fixture->policy)) {
         return false;
     }
 
-    fixture->ready = true;
+    fixture->context_ready = true;
     return true;
 }
 
 static void ac_test_integrity_teardown(AcIntegrityFixture *fixture)
 {
-    if (fixture->ready) {
-        ac_context_free(&fixture->context);
+    if (fixture->context_ready) {
+        ac_context_free(fixture->context);
+    }
+    if (fixture->logger_ready) {
         ac_logger_close(&fixture->logger);
     }
     if (fixture->target.process != NULL) {
@@ -628,25 +637,35 @@ static void ac_test_integrity_teardown(AcIntegrityFixture *fixture)
     }
     free(fixture->target.image_path);
     free(fixture->target.directory);
+    free(fixture->policy);
+    free(fixture->context);
     (void)_wremove(fixture->log_path);
 }
 
 static bool ac_test_log_contains(const wchar_t *path, const char *needle)
 {
     FILE *file = _wfopen(path, L"rb");
-    char line[32768];
+    const size_t line_capacity = 32768u;
+    char *line;
+    bool found = false;
 
     if (file == NULL) {
         return false;
     }
-    while (fgets(line, (int)sizeof(line), file) != NULL) {
+    line = (char *)malloc(line_capacity);
+    if (line == NULL) {
+        (void)fclose(file);
+        return false;
+    }
+    while (fgets(line, (int)line_capacity, file) != NULL) {
         if (strstr(line, needle) != NULL) {
-            (void)fclose(file);
-            return true;
+            found = true;
+            break;
         }
     }
+    free(line);
     (void)fclose(file);
-    return false;
+    return found;
 }
 
 static bool ac_test_log_contains_both(
@@ -655,19 +674,27 @@ static bool ac_test_log_contains_both(
     const char *second)
 {
     FILE *file = _wfopen(path, L"rb");
-    char line[32768];
+    const size_t line_capacity = 32768u;
+    char *line;
+    bool found = false;
 
     if (file == NULL) {
         return false;
     }
-    while (fgets(line, (int)sizeof(line), file) != NULL) {
+    line = (char *)malloc(line_capacity);
+    if (line == NULL) {
+        (void)fclose(file);
+        return false;
+    }
+    while (fgets(line, (int)line_capacity, file) != NULL) {
         if (strstr(line, first) != NULL && strstr(line, second) != NULL) {
-            (void)fclose(file);
-            return true;
+            found = true;
+            break;
         }
     }
+    free(line);
     (void)fclose(file);
-    return false;
+    return found;
 }
 
 static const AcIntegrityBaseline *ac_test_find_integrity_baseline(
@@ -704,7 +731,7 @@ static void test_integrity_clean_process_has_no_findings(void)
     }
 
     memset(&stats, 0, sizeof(stats));
-    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 1u, &stats));
 
     AC_CHECK(stats.integrity_modules_checked > 0);
     AC_CHECK(stats.integrity_blocks_checked > 0);
@@ -712,7 +739,7 @@ static void test_integrity_clean_process_has_no_findings(void)
     AC_CHECK(stats.integrity_iat_slots_checked > 0);
     AC_CHECK(stats.integrity_iat_hooks == 0);
     AC_CHECK(stats.integrity_export_hooks == 0);
-    AC_CHECK(fixture.context.integrity.count > 0);
+    AC_CHECK(fixture.context->integrity.count > 0);
     AC_CHECK(ac_wide_to_utf8(
         fixture.target.image_path,
         path_utf8,
@@ -732,7 +759,7 @@ static void test_integrity_clean_process_has_no_findings(void)
     {
         const uintptr_t image_base = (uintptr_t)GetModuleHandleW(NULL);
         const AcIntegrityBaseline *baseline = ac_test_find_integrity_baseline(
-            &fixture.context,
+            fixture.context,
             image_base,
             fixture.target.image_path);
         uint8_t file_sha256[AC_SHA256_DIGEST_SIZE];
@@ -748,9 +775,9 @@ static void test_integrity_clean_process_has_no_findings(void)
         }
 
         memset(&second, 0, sizeof(second));
-        AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 2u, &second));
+        AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 2u, &second));
         baseline = ac_test_find_integrity_baseline(
-            &fixture.context,
+            fixture.context,
             image_base,
             fixture.target.image_path);
         AC_CHECK(baseline != NULL);
@@ -782,7 +809,8 @@ static void test_integrity_reports_patched_text_rva(void)
     uint8_t original_byte;
     bool patched = false;
     char needle[64];
-    char line[32768];
+    const size_t line_capacity = 32768u;
+    char *line = NULL;
     FILE *file;
     bool found_rva = false;
     bool found_event = false;
@@ -794,7 +822,7 @@ static void test_integrity_reports_patched_text_rva(void)
     }
 
     memset(&before, 0, sizeof(before));
-    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &before));
+    AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 1u, &before));
     AC_CHECK(before.integrity_blocks_checked > 0);
 
     if (VirtualProtect(victim, 1u, PAGE_EXECUTE_READWRITE, &original_protection)) {
@@ -804,7 +832,7 @@ static void test_integrity_reports_patched_text_rva(void)
         patched = true;
 
         memset(&after, 0, sizeof(after));
-        AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 2u, &after));
+        AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 2u, &after));
 
         victim[0] = original_byte;
         FlushInstructionCache(GetCurrentProcess(), victim, 1u);
@@ -829,7 +857,10 @@ static void test_integrity_reports_patched_text_rva(void)
     file = _wfopen(fixture.log_path, L"rb");
     AC_CHECK(file != NULL);
     if (file != NULL) {
-        while (fgets(line, (int)sizeof(line), file) != NULL) {
+        line = (char *)malloc(line_capacity);
+        AC_CHECK(line != NULL);
+        while (line != NULL &&
+               fgets(line, (int)line_capacity, file) != NULL) {
             if (strstr(line, "\"event\":\"module_section_modified\"") == NULL) {
                 continue;
             }
@@ -843,6 +874,7 @@ static void test_integrity_reports_patched_text_rva(void)
                 break;
             }
         }
+        free(line);
         (void)fclose(file);
     }
 
@@ -864,7 +896,7 @@ static void test_integrity_reports_every_module_identity(void)
     }
 
     memset(&stats, 0, sizeof(stats));
-    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 1u, &stats));
     AC_CHECK(stats.integrity_modules_checked > 0);
     AC_CHECK(ac_test_log_contains(
         fixture.log_path,
@@ -886,9 +918,9 @@ static void test_integrity_budget_exhaustion_is_reported(void)
         return;
     }
 
-    fixture.context.policy.integrity_budget_bytes = 0;
+    fixture.context->policy.integrity_budget_bytes = 0;
     memset(&stats, 0, sizeof(stats));
-    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 1u, &stats));
     AC_CHECK(stats.integrity_modules_skipped > 0);
     AC_CHECK(stats.integrity_modules_checked == 0);
     AC_CHECK(ac_test_log_contains(
@@ -1294,10 +1326,10 @@ static void test_integrity_reports_manifest_violation(void)
     AC_CHECK(ac_hash_file(manifest_path, digest, &size));
     ac_test_ascii_pin_to_wide(digest, pin);
     AC_CHECK(ac_manifest_load_pinned(&manifest, manifest_path, pin));
-    fixture.context.policy.manifest = &manifest;
+    fixture.context->policy.manifest = &manifest;
 
     memset(&stats, 0, sizeof(stats));
-    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(ac_scan_process(fixture.context, &fixture.target, 1u, &stats));
     AC_CHECK(ac_test_log_contains(
         fixture.log_path,
         "\"event\":\"module_manifest_violation\""));
