@@ -180,18 +180,27 @@ void ac_integrity_cache_init(AcIntegrityCache *cache)
     cache->bytes_allocated = 0;
 }
 
-static void ac_integrity_baseline_release(AcIntegrityBaseline *baseline)
+static void ac_integrity_sections_release(
+    _In_reads_(section_count) AcIntegritySection *sections,
+    size_t section_count)
 {
     size_t index;
 
+    for (index = 0; index < section_count; ++index) {
+        free(sections[index].block_hashes);
+    }
+}
+
+static void ac_integrity_baseline_release(AcIntegrityBaseline *baseline)
+{
     if (baseline == NULL) {
         return;
     }
 
     if (baseline->sections != NULL) {
-        for (index = 0; index < baseline->section_count; ++index) {
-            free(baseline->sections[index].block_hashes);
-        }
+        ac_integrity_sections_release(
+            baseline->sections,
+            baseline->section_count);
     }
     free(baseline->sections);
     free(baseline->export_rvas);

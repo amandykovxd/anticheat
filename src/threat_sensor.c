@@ -796,10 +796,13 @@ static bool ac_unicode_string_equals(
     const UNICODE_STRING *value,
     const wchar_t *expected)
 {
-    const size_t expected_length = expected != NULL ? wcslen(expected) : 0;
+    size_t expected_length;
 
-    return value != NULL && value->Buffer != NULL &&
-           value->Length == expected_length * sizeof(wchar_t) &&
+    if (value == NULL || value->Buffer == NULL || expected == NULL) {
+        return false;
+    }
+    expected_length = wcslen(expected);
+    return value->Length == expected_length * sizeof(wchar_t) &&
            _wcsnicmp(
                value->Buffer,
                expected,

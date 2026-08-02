@@ -135,7 +135,8 @@ static bool ac_manifest_push(
     int required;
     size_t index;
 
-    if (manifest->count >= AC_MANIFEST_MAX_ENTRIES ||
+    if (manifest->count > manifest->capacity ||
+        manifest->count >= AC_MANIFEST_MAX_ENTRIES ||
         file_name_utf8 == NULL || file_name_utf8[0] == '\0' ||
         strchr(file_name_utf8, '/') != NULL ||
         strchr(file_name_utf8, '\\') != NULL ||
@@ -181,7 +182,11 @@ static bool ac_manifest_push(
         manifest->entries = candidate;
         manifest->capacity = new_capacity;
     }
-    manifest->entries[manifest->count++] = entry;
+    if (manifest->entries == NULL || manifest->count >= manifest->capacity) {
+        return false;
+    }
+    manifest->entries[manifest->count] = entry;
+    ++manifest->count;
     return true;
 }
 
