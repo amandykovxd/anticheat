@@ -54,10 +54,23 @@ RULE_ROLLBACK_PATH = re.compile(
 DECISION_FEEDBACK_PATH = re.compile(
     r"^/v1/decisions/([0-9a-f]{64})/feedback$"
 )
+SESSION_TERMINAL_PATH = re.compile(
+    r"^/v1/sessions/([0-9a-f]{32})/terminal$"
+)
 ATTESTATION_CHALLENGE_PATH = "/v1/attestations/challenges"
 ATTESTATION_DOMAIN = b"ac-collector-attestation-v2"
 ATTESTATION_CHALLENGE_BYTES = 16
 ATTESTATION_NONCE_BYTES = 32
+SESSION_TERMINAL_STATES = frozenset(
+    {
+        "clean_shutdown",
+        "target_exit",
+        "collector_loss",
+        "shipper_loss",
+        "heartbeat_timeout",
+        "restart_budget_exhausted",
+    }
+)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -135,6 +148,12 @@ class ReceiverStore:
                     last_heartbeat_seq INTEGER NOT NULL DEFAULT 0,
                     attestation_verified INTEGER NOT NULL DEFAULT 0,
                     attestation_challenge_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    state_reason TEXT,
+                    heartbeat_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                    terminal_at_ms INTEGER,
+                    restart_count INTEGER NOT NULL DEFAULT 0,
+                    terminal_details_json TEXT NOT NULL DEFAULT '{}',
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                 );
@@ -188,6 +207,45 @@ class ReceiverStore:
             if "attestation_challenge_id" not in columns:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN attestation_challenge_id TEXT"
+                )
+            session_migrations = {
+                "state": "TEXT NOT NULL DEFAULT 'active'",
+                "state_reason": "TEXT",
+                "heartbeat_deadline_ms": "INTEGER NOT NULL DEFAULT 0",
+                "terminal_at_ms": "INTEGER",
+                "restart_count": "INTEGER NOT NULL DEFAULT 0",
+                "terminal_details_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, declaration in session_migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {column} {declaration}"
+                    )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_transitions (
+                    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    previous_state TEXT NOT NULL,
+                    next_state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    restart_count INTEGER NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                )
+                """
+            )
+            transition_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(session_transitions)"
+                ).fetchall()
+            }
+            if "details_json" not in transition_columns:
+                connection.execute(
+                    "ALTER TABLE session_transitions ADD COLUMN details_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
                 )
             challenge_columns = {
                 row["name"]
@@ -408,10 +466,15 @@ class ReceiverStore:
             connection.execute(
                 """
                 UPDATE sessions
-                   SET attestation_verified = 1, attestation_challenge_id = ?
+                   SET attestation_verified = 1, attestation_challenge_id = ?,
+                       state = 'active', heartbeat_deadline_ms = ?
                  WHERE session_id = ?
                 """,
-                (challenge_id, session["session_id"]),
+                (
+                    challenge_id,
+                    now + self.heartbeat_interval_ms * 2,
+                    session["session_id"],
+                ),
             )
 
     @staticmethod
@@ -534,8 +597,9 @@ class ReceiverStore:
                 INSERT INTO sessions (
                     session_id, client_session_id, collector_id,
                     protocol_version, schema_version, chain_algorithm,
-                    chain_seed, chain_head, created_at_ms, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    chain_seed, chain_head, state, heartbeat_deadline_ms,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -546,6 +610,10 @@ class ReceiverStore:
                     chain_algorithm,
                     chain_seed,
                     chain_seed,
+                    "awaiting_attestation"
+                    if collector_id in self.trusted_collectors
+                    else "active",
+                    now + self.heartbeat_interval_ms * 2,
                     now,
                     now,
                 ),
@@ -608,6 +676,13 @@ class ReceiverStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             session = self._load_session(connection, session_id)
+            if session["state"] in SESSION_TERMINAL_STATES:
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "session_terminal",
+                    "terminal sessions cannot accept additional batches",
+                    {"state": session["state"]},
+                )
             duplicate = connection.execute(
                 "SELECT request_sha256 FROM batches WHERE session_id = ? AND batch_seq = ?",
                 (session_id, batch_seq),
@@ -746,6 +821,15 @@ class ReceiverStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             session = self._load_session(connection, session_id)
+            self._expire_sessions(connection, now, session_id)
+            session = self._load_session(connection, session_id)
+            if session["state"] in SESSION_TERMINAL_STATES:
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "session_terminal",
+                    "terminal sessions cannot accept heartbeats",
+                    {"state": session["state"]},
+                )
             if (
                 session["collector_id"] in self.trusted_collectors
                 and session["attestation_verified"] != 1
@@ -819,10 +903,16 @@ class ReceiverStore:
             connection.execute(
                 """
                 UPDATE sessions
-                   SET last_heartbeat_seq = ?, updated_at_ms = ?
+                   SET last_heartbeat_seq = ?, updated_at_ms = ?,
+                       state = 'active', heartbeat_deadline_ms = ?
                  WHERE session_id = ?
                 """,
-                (heartbeat_seq, now, session_id),
+                (
+                    heartbeat_seq,
+                    now,
+                    now + self.heartbeat_interval_ms * 2,
+                    session_id,
+                ),
             )
             return HTTPStatus.ACCEPTED, {
                 "accepted": True,
@@ -833,6 +923,8 @@ class ReceiverStore:
 
     def session_status(self, session_id: str) -> dict[str, Any]:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_sessions(connection, _now_ms(), session_id)
             row = self._load_session(connection, session_id)
             return {
                 "session_id": row["session_id"],
@@ -847,10 +939,180 @@ class ReceiverStore:
                 "attestation_required": row["collector_id"] in self.trusted_collectors,
                 "attestation_verified": bool(row["attestation_verified"]),
                 "attestation_challenge_id": row["attestation_challenge_id"],
+                "state": row["state"],
+                "state_reason": row["state_reason"],
+                "heartbeat_deadline_ms": row["heartbeat_deadline_ms"],
+                "terminal_at_ms": row["terminal_at_ms"],
+                "restart_count": row["restart_count"],
+                "terminal_details": json.loads(row["terminal_details_json"]),
                 "correlation_decisions": len(
                     CorrelationEngine.decisions(connection, session_id)
                 ),
             }
+
+    @staticmethod
+    def _transition_terminal(
+        connection: sqlite3.Connection,
+        session: sqlite3.Row,
+        state: str,
+        reason: str,
+        restart_count: int,
+        now: int,
+        details_json: str = "{}",
+    ) -> bool:
+        if session["state"] in SESSION_TERMINAL_STATES:
+            if (
+                session["state"] == state
+                and session["state_reason"] == reason
+                and int(session["restart_count"]) == restart_count
+                and session["terminal_details_json"] == details_json
+            ):
+                return False
+            raise ReceiverError(
+                HTTPStatus.CONFLICT,
+                "terminal_transition_conflict",
+                "a terminal session cannot transition to another state",
+                {"state": session["state"]},
+            )
+        connection.execute(
+            """
+            UPDATE sessions
+               SET state = ?, state_reason = ?, terminal_at_ms = ?,
+                   restart_count = ?, terminal_details_json = ?, updated_at_ms = ?
+             WHERE session_id = ?
+            """,
+            (
+                state,
+                reason,
+                now,
+                restart_count,
+                details_json,
+                now,
+                session["session_id"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_transitions (
+                session_id, previous_state, next_state, reason,
+                restart_count, details_json, created_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session["session_id"],
+                session["state"],
+                state,
+                reason,
+                restart_count,
+                details_json,
+                now,
+            ),
+        )
+        return True
+
+    def _expire_sessions(
+        self,
+        connection: sqlite3.Connection,
+        now: int,
+        session_id: str | None = None,
+    ) -> int:
+        query = (
+            "SELECT * FROM sessions WHERE terminal_at_ms IS NULL "
+            "AND heartbeat_deadline_ms > 0 AND heartbeat_deadline_ms < ?"
+        )
+        parameters: tuple[Any, ...] = (now,)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            parameters = (now, session_id)
+        expired = connection.execute(query, parameters).fetchall()
+        for session in expired:
+            self._transition_terminal(
+                connection,
+                session,
+                "heartbeat_timeout",
+                "negotiated heartbeat deadline expired",
+                int(session["restart_count"]),
+                now,
+            )
+        return len(expired)
+
+    def expire_sessions(self, now_ms: int | None = None) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._expire_sessions(
+                connection, _now_ms() if now_ms is None else now_ms
+            )
+
+    def mark_session_terminal(
+        self,
+        session_id: str,
+        request: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            state = require_string(request.get("state"), "state", 64)
+            reason = require_string(request.get("reason"), "reason", 512)
+            restart_count = require_integer(
+                request.get("restart_count", 0),
+                "restart_count",
+                0,
+                1_000_000,
+            )
+            processes = request.get("processes", {})
+            if not isinstance(processes, dict) or len(processes) > 2:
+                raise ProtocolError("processes must contain at most two roles")
+            normalized_processes: dict[str, dict[str, Any]] = {}
+            for role, identity in processes.items():
+                if role not in {"collector", "shipper"} or not isinstance(
+                    identity, dict
+                ):
+                    raise ProtocolError("process identity role is invalid")
+                normalized_processes[role] = {
+                    "pid": require_integer(
+                        identity.get("pid"), "pid", 1, 0xFFFFFFFF
+                    ),
+                    "creation_time_ms": require_integer(
+                        identity.get("creation_time_ms"),
+                        "creation_time_ms",
+                        0,
+                        0x7FFFFFFFFFFFFFFF,
+                    ),
+                    "observed_sha256": require_sha256(
+                        identity.get("observed_sha256"), "observed_sha256"
+                    ),
+                }
+            details_json = canonical_json(
+                {"processes": normalized_processes}
+            ).decode("utf-8")
+        except ProtocolError as error:
+            raise ReceiverError(
+                HTTPStatus.BAD_REQUEST, "request_invalid", str(error)
+            ) from error
+        if state not in SESSION_TERMINAL_STATES or state == "heartbeat_timeout":
+            raise ReceiverError(
+                HTTPStatus.BAD_REQUEST,
+                "terminal_state_invalid",
+                "state is not a client-reportable terminal state",
+            )
+        now = _now_ms()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._load_session(connection, session_id)
+            changed = self._transition_terminal(
+                connection,
+                session,
+                state,
+                reason,
+                restart_count,
+                now,
+                details_json,
+            )
+        return (HTTPStatus.ACCEPTED if changed else HTTPStatus.OK), {
+            "accepted": True,
+            "duplicate": not changed,
+            "session_id": session_id,
+            "state": state,
+            "terminal_at_ms": now if changed else session["terminal_at_ms"],
+        }
 
     def install_rule(self, definition: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection:
@@ -898,6 +1160,10 @@ class ReceiverHttpServer(ThreadingHTTPServer):
         super().__init__(address, ReceiverRequestHandler)
         self.store = store
         self.bearer_token = bearer_token
+
+    def service_actions(self) -> None:
+        """Expire missed heartbeat deadlines on every server poll cycle."""
+        self.store.expire_sessions()
 
 
 class ReceiverRequestHandler(BaseHTTPRequestHandler):
@@ -1056,6 +1322,7 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 promote_match = RULE_PROMOTE_PATH.fullmatch(self.path)
                 rollback_match = RULE_ROLLBACK_PATH.fullmatch(self.path)
                 feedback_match = DECISION_FEEDBACK_PATH.fullmatch(self.path)
+                terminal_match = SESSION_TERMINAL_PATH.fullmatch(self.path)
                 if batch_match is not None:
                     status, response = self.server.store.append_batch(
                         batch_match.group(1), request
@@ -1063,6 +1330,10 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 elif heartbeat_match is not None:
                     status, response = self.server.store.append_heartbeat(
                         heartbeat_match.group(1), request
+                    )
+                elif terminal_match is not None:
+                    status, response = self.server.store.mark_session_terminal(
+                        terminal_match.group(1), request
                     )
                 elif promote_match is not None:
                     response = self.server.store.promote_rule(

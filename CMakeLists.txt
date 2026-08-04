@@ -81,6 +81,21 @@ if(BUILD_TESTING)
                 ENVIRONMENT
                     "PYTHONDONTWRITEBYTECODE=1;PYTHONWARNINGS=error::ResourceWarning"
         )
+        add_test(
+            NAME operations.watchdog
+            COMMAND
+                ${Python3_EXECUTABLE}
+                -m unittest -v tests/test_watchdog.py
+        )
+        set_tests_properties(
+            operations.watchdog
+            PROPERTIES
+                LABELS "operations;integration"
+                TIMEOUT 60
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1;PYTHONWARNINGS=error::ResourceWarning"
+        )
     endif()
 endif()
 
@@ -90,6 +105,7 @@ install(
         tools/correlation_rules.py
         tools/request_attestation_challenge.py
         tools/telemetry_shipper.py
+        tools/session_watchdog.py
         tools/transport_common.py
         tools/verify_log.py
     DESTINATION tools
@@ -98,6 +114,7 @@ install(
     FILES
         docs/transport-integration.md
         docs/correlation-integration.md
+        docs/watchdog-integration.md
     DESTINATION docs
 )
 
@@ -250,6 +267,21 @@ if(MINGW)
 endif()
 ac_enable_warnings(anticheat)
 
+add_executable(anticheat_watchdog_service src/watchdog_service.c)
+target_compile_definitions(anticheat_watchdog_service PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _CRT_SECURE_NO_WARNINGS
+    _WIN32_WINNT=0x0601
+)
+target_link_libraries(anticheat_watchdog_service PRIVATE advapi32)
+if(MINGW)
+    target_link_options(anticheat_watchdog_service PRIVATE -municode)
+endif()
+ac_enable_warnings(anticheat_watchdog_service)
+
 if(BUILD_TESTING)
     add_executable(anticheat_tests tests/test_core.c)
     target_link_libraries(anticheat_tests PRIVATE anticheat_core)
@@ -321,4 +353,11 @@ if(BUILD_TESTING)
     endforeach()
 endif()
 
-install(TARGETS anticheat RUNTIME DESTINATION bin)
+install(TARGETS anticheat anticheat_watchdog_service RUNTIME DESTINATION bin)
+install(
+    PROGRAMS
+        tools/windows/Install-WatchdogService.ps1
+        tools/windows/Update-WatchdogService.ps1
+        tools/windows/Uninstall-WatchdogService.ps1
+    DESTINATION tools/windows
+)

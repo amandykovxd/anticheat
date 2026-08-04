@@ -135,8 +135,8 @@ jobs:
               Out-String |
               ConvertFrom-Json
           )
-          if ($inventory.tests.Count -ne 60) {
-            throw "Expected 60 independent tests, found $($inventory.tests.Count)"
+          if ($inventory.tests.Count -ne 61) {
+            throw "Expected 61 independent tests, found $($inventory.tests.Count)"
           }
 
       - name: Test
@@ -181,8 +181,17 @@ jobs:
             --config Release `
             --prefix '${{ matrix.install_dir }}'
           $collector = Join-Path '${{ matrix.install_dir }}' 'bin\anticheat.exe'
-          $digest = (Get-FileHash -Algorithm SHA256 $collector).Hash.ToLowerInvariant()
-          "$digest  anticheat.exe" |
+          $watchdog = Join-Path '${{ matrix.install_dir }}' 'bin\anticheat_watchdog_service.exe'
+          $watchdogScript = Join-Path '${{ matrix.install_dir }}' 'tools\session_watchdog.py'
+          $lines = @($collector, $watchdog, $watchdogScript) | ForEach-Object {
+            $digest = (Get-FileHash -Algorithm SHA256 $_).Hash.ToLowerInvariant()
+            $relative = [IO.Path]::GetRelativePath(
+              (Resolve-Path '${{ matrix.install_dir }}').Path,
+              (Resolve-Path $_).Path
+            ).Replace('\', '/')
+            "$digest  $relative"
+          }
+          $lines |
             Set-Content -Encoding ascii '${{ matrix.install_dir }}\SHA256SUMS'
           Copy-Item smoke.jsonl '${{ matrix.install_dir }}\smoke.jsonl'
 
@@ -212,7 +221,7 @@ jobs:
       - name: Verify automated test inventory
         run: |
           count=$(ctest --preset macos-release -N | sed -n 's/^Total Tests: //p')
-          test "$count" = 27
+          test "$count" = 28
 
       - name: Install
         run: cmake --install out/build/macos --prefix out/install/macos
@@ -258,7 +267,7 @@ jobs:
       - name: Verify automated test inventory
         run: |
           count=$(ctest --test-dir out/build/linux -N | sed -n 's/^Total Tests: //p')
-          test "$count" = 27
+          test "$count" = 28
 
       - name: Test
         run: ctest --test-dir out/build/linux --output-on-failure

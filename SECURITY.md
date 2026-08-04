@@ -8,12 +8,14 @@ This repository contains:
 - a user-mode process scanner and event collector;
 - a local tamper-evident JSONL logger;
 - an asynchronous authenticated transport sidecar;
+- a Windows service host and collector/shipper watchdog;
 - a reference remote anchor receiver;
+- an audit-only correlation rules engine;
 - a log-chain verification utility.
 
 The system produces telemetry for an explicitly registered target process.
 Enforcement, account actions, production identity provisioning, and
-server-side correlation are outside the repository.
+production policy are outside the repository.
 
 ## Trust boundaries
 
@@ -30,6 +32,8 @@ User boundary
   anticheat.exe
   target process read handle
   local JSONL output
+  session_watchdog.py
+  bounded paired restart
            |
            v
 Integrator boundary
@@ -45,6 +49,15 @@ counters. The collector is trusted to validate the driver protocol, classify
 user-space memory, and serialize events. A local administrator can replace,
 stop, or alter both components and must be included in the deployment threat
 model.
+
+The watchdog validates configured collector and shipper SHA-256 identities
+before each launch, retains PID plus creation-time identity, and reports
+terminal state to the receiver. The native service runs as LocalSystem but
+launches the supervisor with nonessential privileges disabled and a
+kill-on-close job object. This separates accidental or same-user process loss
+from target behavior; it does not resist a hostile LocalSystem administrator or
+kernel component. The receiver's independently evaluated heartbeat deadline is
+authoritative when the local watchdog is unavailable.
 
 ## Kernel driver security properties
 
@@ -208,6 +221,13 @@ TLS batches. `tools/reference_receiver.py` independently verifies each chain
 transition and persists the accepted chain head under a server-issued session
 identifier. Production deployments must protect receiver storage against
 operator rollback and monitor missing heartbeat intervals.
+
+The receiver transitions every expired active session to
+`heartbeat_timeout` during its server poll cycle. Explicit terminal requests
+are authenticated, validate bounded process identity details, and cannot reopen
+a terminal session. The watchdog durably retries terminal notifications after
+network failure; a restarted collector/shipper pair obtains a fresh attestation
+challenge and creates a new remote chain rather than continuing a terminal one.
 
 For registered release identities, the receiver also issues a short-lived
 nonce and validates `collector_attestation_observed` before accepting

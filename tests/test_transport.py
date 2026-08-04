@@ -306,6 +306,88 @@ class ReceiverStoreTests(unittest.TestCase):
             self.store.append_heartbeat(self.session_id, heartbeat)
         self.assertEqual(captured.exception.code, "heartbeat_anchor_mismatch")
 
+    def test_stale_heartbeat_marks_session_terminal(self) -> None:
+        state = self.store.session_status(self.session_id)
+        expired = self.store.expire_sessions(
+            int(state["heartbeat_deadline_ms"]) + 1
+        )
+        self.assertEqual(expired, 1)
+        terminal = self.store.session_status(self.session_id)
+        self.assertEqual(terminal["state"], "heartbeat_timeout")
+        self.assertIsNotNone(terminal["terminal_at_ms"])
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_heartbeat(
+                self.session_id,
+                {
+                    "heartbeat_seq": 1,
+                    "last_batch_seq": 0,
+                    "last_event_seq": 0,
+                    "chain_head": self.seed,
+                },
+            )
+        self.assertEqual(captured.exception.code, "session_terminal")
+
+    def test_explicit_terminal_transition_is_idempotent_and_final(self) -> None:
+        request = {
+            "state": "collector_loss",
+            "reason": "collector exited without a chained stop event",
+            "restart_count": 2,
+            "processes": {
+                "collector": {
+                    "pid": 4321,
+                    "creation_time_ms": 123456,
+                    "observed_sha256": "d" * 64,
+                }
+            },
+        }
+        status, response = self.store.mark_session_terminal(
+            self.session_id, request
+        )
+        self.assertEqual(status, HTTPStatus.ACCEPTED)
+        self.assertFalse(response["duplicate"])
+        status, response = self.store.mark_session_terminal(
+            self.session_id, request
+        )
+        self.assertEqual(status, HTTPStatus.OK)
+        self.assertTrue(response["duplicate"])
+        state = self.store.session_status(self.session_id)
+        self.assertEqual(state["state"], "collector_loss")
+        self.assertEqual(state["restart_count"], 2)
+        self.assertEqual(
+            state["terminal_details"]["processes"]["collector"]["pid"],
+            4321,
+        )
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.mark_session_terminal(
+                self.session_id,
+                {
+                    "state": "clean_shutdown",
+                    "reason": "conflicting terminal claim",
+                },
+            )
+        self.assertEqual(captured.exception.code, "terminal_transition_conflict")
+
+    def test_heartbeat_renews_authoritative_deadline(self) -> None:
+        initial = self.store.session_status(self.session_id)
+        request = batch_request(self.seed, self.records)
+        self.store.append_batch(self.session_id, request)
+        heartbeat_time = int(initial["heartbeat_deadline_ms"]) - 1
+        with mock.patch("reference_receiver._now_ms", return_value=heartbeat_time):
+            self.store.append_heartbeat(
+                self.session_id,
+                {
+                    "heartbeat_seq": 1,
+                    "last_batch_seq": 1,
+                    "last_event_seq": 4,
+                    "chain_head": request["chain_head"],
+                },
+            )
+            renewed = self.store.session_status(self.session_id)
+        self.assertGreater(
+            int(renewed["heartbeat_deadline_ms"]),
+            int(initial["heartbeat_deadline_ms"]),
+        )
+
 
 class CollectorAttestationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -781,6 +863,17 @@ class HttpAuthenticationTests(unittest.TestCase):
     def test_plain_http_requires_explicit_development_override(self) -> None:
         with self.assertRaisesRegex(Exception, "must use HTTPS"):
             ReceiverClient(self.endpoint, "t" * 32)
+
+    def test_server_poll_expires_heartbeat_without_client_request(self) -> None:
+        _, response = self.server.store.create_session(session_request(self.seed))
+        session_id = response["session_id"]
+        deadline = int(
+            self.server.store.session_status(session_id)["heartbeat_deadline_ms"]
+        )
+        with mock.patch("reference_receiver._now_ms", return_value=deadline + 1):
+            self.server.service_actions()
+            state = self.server.store.session_status(session_id)
+        self.assertEqual(state["state"], "heartbeat_timeout")
 
 
 if __name__ == "__main__":

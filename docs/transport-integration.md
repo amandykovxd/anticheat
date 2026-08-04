@@ -121,6 +121,7 @@ verification.
 | `POST /v1/sessions` | Idempotently register a client session and return a server session ID. |
 | `POST /v1/sessions/{id}/batches` | Verify and anchor the next ordered event batch. |
 | `POST /v1/sessions/{id}/heartbeat` | Confirm liveness and the latest accepted remote anchor. |
+| `POST /v1/sessions/{id}/terminal` | Record an idempotent terminal state from the watchdog. |
 | `GET /v1/sessions/{id}` | Return authenticated session state for operations. |
 | `GET /healthz` | Return receiver process health. |
 
@@ -165,9 +166,12 @@ wrong anchor returns a permanent 4xx response.
 
 A heartbeat contains its own monotonic sequence plus the last acknowledged
 batch sequence, event sequence, and chain head. The receiver rejects a
-heartbeat that does not exactly match remotely retained state. Operations
-should alert after two negotiated heartbeat intervals without a successful
-heartbeat and retain the last remote anchor for investigation.
+heartbeat that does not exactly match remotely retained state. The receiver
+stores an authoritative deadline and transitions an overdue session to
+`heartbeat_timeout`; subsequent batches and heartbeats are rejected. Deploy
+`session_watchdog.py` as described in
+[watchdog-integration.md](watchdog-integration.md) to report explicit collector,
+shipper, target-exit, and planned-shutdown transitions.
 
 ## Spool and backpressure policy
 

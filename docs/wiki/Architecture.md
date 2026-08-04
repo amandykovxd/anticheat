@@ -25,7 +25,13 @@ AcTelemetry.sys
 tamper-evident JSONL
         |
         v
-integrator transport, storage, correlation, and policy
+telemetry shipper and remote receiver
+        ^
+        |
+collector/shipper watchdog and terminal-state reporting
+        |
+        v
+integrator storage, correlation, and policy
 ```
 
 ## Kernel boundary

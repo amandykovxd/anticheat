@@ -14,6 +14,8 @@ macOS and Linux collectors, composed of:
 - `tools/telemetry_shipper.py`: bounded asynchronous delivery sidecar;
 - `tools/reference_receiver.py`: authenticated remote anchor receiver;
 - `tools/correlation_rules.py`: versioned audit-only server correlation;
+- `anticheat_watchdog_service.exe`: least-privilege Windows service host;
+- `tools/session_watchdog.py`: collector and shipper liveness supervisor;
 - `tools/verify_log.py`: JSONL integrity-chain verifier;
 - a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
@@ -61,6 +63,9 @@ reference_receiver.py remote anchors
                |
                v
 integrator-owned correlation and policy
+               ^
+               |
+session_watchdog.py process identity, restart budget, terminal state
 ```
 
 The driver and collector use the shared ABI defined in
@@ -79,7 +84,8 @@ event record also carries thread and foreign-handle observations.
 | macOS user-mode collector | Apple Silicon, Intel | Xcode Command Line Tools and CMake 3.24+ |
 | Linux procfs collector | x64, ARM64 | C11 compiler, procfs, and CMake 3.24+ |
 | Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
-| Transport sidecar and reference receiver | Linux, macOS, Windows | Python 3.10+ |
+| Transport, receiver, and watchdog supervisor | Linux, macOS, Windows | Python 3.10+ |
+| Native watchdog service host | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
 | Log verifier | Platform-independent | Python 3.10+ |
 
 Use the x64 collector for x64 targets. A Win32 collector cannot enumerate all
@@ -133,17 +139,19 @@ are additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Automated test inventory
 
-Windows builds register 60 independent CTest cases: 21 portable algorithms,
-35 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
-macOS builds register 27 cases: 21 portable cases, 3 CLI contracts, one live
+Windows builds register 61 independent CTest cases: 21 portable algorithms,
+35 Windows collector/core behaviors, 3 CLI contracts, the transport suite, and
+the watchdog suite.
+macOS builds register 28 cases: 21 portable cases, 3 CLI contracts, one live
 self-scan, one suspicious-region integration test, and the transport suite.
-Linux builds register 27 cases: 21 portable cases, 3 Linux collector
+Linux builds register 28 cases: 21 portable cases, 3 Linux collector
 contracts, one suspicious-mapping test, one process-audit test, and the
-transport suite.
+transport and watchdog suites.
 The transport CTest entry contains
-36 protocol, attestation, correlation, persistence, tamper, authentication,
+40 protocol, attestation, correlation, persistence, tamper, authentication,
 rotation, and backpressure
-tests.
+tests. The watchdog entry contains 11 process identity, restart, terminal-state,
+and failure-recovery tests.
 
 List the registered cases without executing them:
 
@@ -158,9 +166,10 @@ ctest --preset windows-x64-release -L portable
 ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 ```
 
-The available labels include `portable`, `core`, `cli`, `windows`, `macos`, `linux`,
-`transport`, and `integration`. The Windows CI matrix rejects a configuration
-that does not expose exactly 52 independent CTest entries.
+The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
+`linux`, `transport`, `operations`, and `integration`. The Windows CI matrix
+rejects a configuration that does not expose exactly 61 independent CTest
+entries.
 
 ## Build and run on macOS
 
@@ -655,7 +664,8 @@ tests/
   test_transport.py       remote anchoring and spool tests
 tools/
   telemetry_shipper.py    bounded asynchronous delivery sidecar
-  reference_receiver.py  authenticated anchor receiver
+  session_watchdog.py     process identity and liveness supervisor
+  reference_receiver.py   authenticated anchor receiver
   transport_common.py     shared protocol and chain validation
   verify_log.py           log-chain verifier
 ```
@@ -664,6 +674,7 @@ tools/
 
 - [Driver integration](docs/driver-integration.md)
 - [Transport integration](docs/transport-integration.md)
+- [Watchdog service integration](docs/watchdog-integration.md)
 - [Event schema](docs/event-schema.md)
 - [Adversarial analysis](docs/adversarial-analysis.md)
 - [DragonBurn defensive analysis](docs/dragonburn-threat-analysis.md)

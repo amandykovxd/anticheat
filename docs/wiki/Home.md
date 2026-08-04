@@ -15,6 +15,7 @@ integrator-owned.
 - [Kernel driver development](Kernel-Driver-Development)
 - [Event pipeline](Event-Pipeline)
 - [Security operations](Security-Operations)
+- [Watchdog service integration](../watchdog-integration)
 - [Contribution workflow](Contribution-Workflow)
 - [Engineering project](https://github.com/users/amandykovxd/projects/1)
 - [Source repository](https://github.com/amandykovxd/anticheat)
@@ -33,8 +34,9 @@ Implemented components:
 - event de-duplication and bounded scan budgets;
 - JSONL rotation and SHA-256 integrity chain;
 - authenticated transport sidecar and reference receiver;
+- Windows collector/shipper watchdog and authoritative heartbeat deadlines;
+- versioned audit-only correlation rules;
 - WDK x64, collector, sanitizer, and CodeQL validation workflows.
 
 Production deployment still requires Driver Verifier, HLK validation, package
-signing, installer lifecycle tests, and an integrator-owned correlation
-service.
+signing, installer lifecycle tests, and integrator-owned production policy.
