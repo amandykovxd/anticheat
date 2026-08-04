@@ -210,7 +210,6 @@ static void ac_logger_emit_locked(
     SYSTEMTIME timestamp;
     AcSha256 hash;
     char escaped_event[256];
-    char *storage;
     char *body;
     char *line;
     char chain_hex[AC_SHA256_HEX_SIZE];
@@ -218,13 +217,14 @@ static void ac_logger_emit_locked(
     int body_length;
     int line_length;
 
-    storage = (char *)malloc(AC_LOG_BODY_CAPACITY + AC_LOG_LINE_CAPACITY);
-    if (storage == NULL) {
+    body = (char *)malloc(AC_LOG_BODY_CAPACITY);
+    line = (char *)malloc(AC_LOG_LINE_CAPACITY);
+    if (body == NULL || line == NULL) {
+        free(body);
+        free(line);
         ++logger->write_failures;
         return;
     }
-    body = storage;
-    line = storage + AC_LOG_BODY_CAPACITY;
 
     if (logger->max_bytes > 0 && !logger->rotating &&
         logger->bytes_written >= logger->max_bytes) {
@@ -286,7 +286,8 @@ static void ac_logger_emit_locked(
             (unsigned long)pid);
         if (body_length < 0 || (size_t)body_length >= AC_LOG_BODY_CAPACITY) {
             ++logger->write_failures;
-            free(storage);
+            free(body);
+            free(line);
             return;
         }
     }
@@ -305,12 +306,14 @@ static void ac_logger_emit_locked(
         chain_hex);
     if (line_length < 0 || (size_t)line_length >= AC_LOG_LINE_CAPACITY) {
         ++logger->write_failures;
-        free(storage);
+        free(body);
+        free(line);
         return;
     }
 
     (void)ac_logger_write_raw_locked(logger, line, (size_t)line_length);
-    free(storage);
+    free(body);
+    free(line);
 }
 
 bool ac_logger_open(

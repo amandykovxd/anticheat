@@ -21,6 +21,31 @@ static void ac_kernel_client_reset_health(AcKernelClient *client)
     client->callback_state_initialized = false;
     client->queue_saturated = false;
     client->telemetry_complete = true;
+    client->correlation_random_source_available = true;
+}
+
+static size_t ac_kernel_reservoir_index(
+    uint64_t observations_seen,
+    uint64_t fallback,
+    bool *secure_out)
+{
+    uint64_t random_value = 0;
+
+    if (BCryptGenRandom(
+            NULL,
+            (PUCHAR)&random_value,
+            (ULONG)sizeof(random_value),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        random_value = fallback ^ observations_seen;
+        random_value ^= random_value >> 12;
+        random_value ^= random_value << 25;
+        random_value ^= random_value >> 27;
+        random_value *= UINT64_C(2685821657736338717);
+        *secure_out = false;
+    } else {
+        *secure_out = true;
+    }
+    return (size_t)(random_value % observations_seen);
 }
 
 void ac_kernel_client_init(AcKernelClient *client)
@@ -32,6 +57,7 @@ void ac_kernel_client_init(AcKernelClient *client)
     memset(client, 0, sizeof(*client));
     client->device = INVALID_HANDLE_VALUE;
     client->telemetry_complete = true;
+    client->correlation_random_source_available = true;
 }
 
 bool ac_kernel_client_open(AcKernelClient *client)
@@ -508,13 +534,28 @@ static void ac_kernel_client_observe_thread(
         event->parent_process_id);
     if (client->thread_observation_count >=
         AC_KERNEL_MAX_THREAD_OBSERVATIONS) {
+        bool secure = false;
+        const uint64_t observations_seen =
+            (uint64_t)client->thread_observation_count +
+            client->thread_observations_omitted + 1u;
+        const size_t selected = ac_kernel_reservoir_index(
+            observations_seen,
+            event->sequence,
+            &secure);
+
         ++client->thread_observations_omitted;
         client->telemetry_complete = false;
-        return;
+        if (!secure) {
+            client->correlation_random_source_available = false;
+        }
+        if (selected >= AC_KERNEL_MAX_THREAD_OBSERVATIONS) {
+            return;
+        }
+        observation = &client->thread_observations[selected];
+    } else {
+        observation = &client->thread_observations[
+            client->thread_observation_count++];
     }
-
-    observation = &client->thread_observations[
-        client->thread_observation_count++];
     observation->sequence = event->sequence;
     observation->start_address = event->image_base;
     observation->thread_id = event->parent_process_id;
@@ -535,13 +576,28 @@ static void ac_kernel_client_observe_image(
 
     if (client->image_observation_count >=
         AC_KERNEL_MAX_IMAGE_OBSERVATIONS) {
+        bool secure = false;
+        const uint64_t observations_seen =
+            (uint64_t)client->image_observation_count +
+            client->image_observations_omitted + 1u;
+        const size_t selected = ac_kernel_reservoir_index(
+            observations_seen,
+            event->sequence,
+            &secure);
+
         ++client->image_observations_omitted;
         client->telemetry_complete = false;
-        return;
+        if (!secure) {
+            client->correlation_random_source_available = false;
+        }
+        if (selected >= AC_KERNEL_MAX_IMAGE_OBSERVATIONS) {
+            return;
+        }
+        observation = &client->image_observations[selected];
+    } else {
+        observation = &client->image_observations[
+            client->image_observation_count++];
     }
-
-    observation = &client->image_observations[
-        client->image_observation_count++];
     observation->sequence = event->sequence;
     observation->image_base = event->image_base;
     observation->image_size = event->image_size;
@@ -918,12 +974,14 @@ void ac_kernel_client_correlate_scan(
             ",\"thread_observations_omitted\":%" PRIu64
             ",\"mismatch_events_omitted\":%zu,"
             "\"thread_events_omitted\":%zu,"
+            "\"random_source_available\":%s,"
             "\"telemetry_complete\":false}",
             scan_id,
             omitted,
             thread_omitted,
             mismatches - image_reported,
-            suspicious_threads - thread_reported);
+            suspicious_threads - thread_reported,
+            client->correlation_random_source_available ? "true" : "false");
         ac_log_event(
             logger,
             AC_SEVERITY_HIGH,
@@ -991,4 +1049,5 @@ void ac_kernel_client_correlate_scan(
     client->image_observations_omitted = 0;
     client->thread_observation_count = 0;
     client->thread_observations_omitted = 0;
+    client->correlation_random_source_available = true;
 }

@@ -1397,6 +1397,7 @@ static void test_collector_attestation_current_image(void)
     AC_CHECK(ac_collector_attest(
         L"00112233445566778899aabbccddeeff",
         L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"102132435465768798a9babbdcddedef",
         &result));
     AC_CHECK(result.complete);
     AC_CHECK(result.mapped_matches_disk);
@@ -1408,20 +1409,25 @@ static void test_collector_attestation_current_image(void)
         result.expected_mapped_sha256,
         result.observed_mapped_sha256) == 0);
     AC_CHECK(strlen(result.response_sha256) == 64u);
+    AC_CHECK(strcmp(result.collector_version, AC_AGENT_VERSION) == 0);
+    AC_CHECK(strcmp(result.collector_build_id, result.file_sha256) == 0);
 }
 
 static void test_collector_attestation_nonce_binding(void)
 {
     AcCollectorAttestation first;
     AcCollectorAttestation second;
+    AcCollectorAttestation third;
 
     AC_CHECK(ac_collector_attest(
         L"00112233445566778899aabbccddeeff",
         L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"102132435465768798a9babbdcddedef",
         &first));
     AC_CHECK(ac_collector_attest(
         L"00112233445566778899aabbccddeeff",
         L"100102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"102132435465768798a9babbdcddedef",
         &second));
     AC_CHECK(strcmp(first.file_sha256, second.file_sha256) == 0);
     AC_CHECK(strcmp(
@@ -1429,6 +1435,15 @@ static void test_collector_attestation_nonce_binding(void)
         second.expected_mapped_sha256) == 0);
     AC_CHECK(strcmp(first.nonce_sha256, second.nonce_sha256) != 0);
     AC_CHECK(strcmp(first.response_sha256, second.response_sha256) != 0);
+    AC_CHECK(ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"ffffffffffffffffffffffffffffffff",
+        &third));
+    AC_CHECK(strcmp(first.response_sha256, third.response_sha256) != 0);
+    AC_CHECK(strcmp(
+        third.server_session_id,
+        "ffffffffffffffffffffffffffffffff") == 0);
 }
 
 static void test_collector_attestation_rejects_invalid_challenge(void)
@@ -1438,10 +1453,17 @@ static void test_collector_attestation_rejects_invalid_challenge(void)
     AC_CHECK(!ac_collector_attest(
         L"short",
         L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"102132435465768798a9babbdcddedef",
         &result));
     AC_CHECK(!ac_collector_attest(
         L"00112233445566778899aabbccddeeff",
         L"zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"102132435465768798a9babbdcddedef",
+        &result));
+    AC_CHECK(!ac_collector_attest(
+        L"00112233445566778899aabbccddeeff",
+        L"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        L"short",
         &result));
 }
 

@@ -133,6 +133,7 @@ class TransportSpool:
                     next_event_seq INTEGER NOT NULL,
                     next_batch_seq INTEGER NOT NULL,
                     server_session_id TEXT,
+                    requested_server_session_id TEXT,
                     acknowledged_batch_seq INTEGER NOT NULL DEFAULT 0,
                     acknowledged_event_seq INTEGER NOT NULL DEFAULT 0,
                     acknowledged_chain_head TEXT NOT NULL,
@@ -157,6 +158,17 @@ class TransportSpool:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(local_sessions)"
+                ).fetchall()
+            }
+            if "requested_server_session_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE local_sessions "
+                    "ADD COLUMN requested_server_session_id TEXT"
+                )
 
     @staticmethod
     def _identity(path: Path) -> tuple[int, int, int]:
@@ -401,6 +413,32 @@ class TransportSpool:
                             source_file.seek(line_offset)
                             break
                         records.append(encoded)
+                        if verified.event == "collector_attestation_observed":
+                            details = verified.document.get("details")
+                            if not isinstance(details, dict):
+                                raise ProtocolError(
+                                    "collector attestation details must be an object"
+                                )
+                            requested_session = require_string(
+                                details.get("server_session_id"),
+                                "details.server_session_id",
+                                32,
+                            )
+                            if session["requested_server_session_id"] not in (
+                                None,
+                                requested_session,
+                            ):
+                                raise ProtocolError(
+                                    "collector session contains conflicting server bindings"
+                                )
+                            connection.execute(
+                                """
+                                UPDATE local_sessions
+                                   SET requested_server_session_id = ?
+                                 WHERE local_session_id = ?
+                                """,
+                                (requested_session, session["local_session_id"]),
+                            )
                         chain_head = verified.chain
                         last_event_seq = verified.sequence
                         final_offset = source_file.tell()
@@ -720,6 +758,10 @@ class TelemetryShipper:
                 "chain_algorithm": CHAIN_ALGORITHM,
                 "chain_seed": session["chain_seed"],
             }
+            if session["requested_server_session_id"] is not None:
+                request["requested_session_id"] = session[
+                    "requested_server_session_id"
+                ]
             response = self.receiver.request("/v1/sessions", request)
             server_session_id = require_string(
                 response.get("session_id"), "response.session_id", 32

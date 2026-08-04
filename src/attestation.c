@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define AC_ATTESTATION_FILE_LIMIT (256ull * 1024ull * 1024ull)
-#define AC_ATTESTATION_DOMAIN "ac-collector-attestation-v1"
+#define AC_ATTESTATION_DOMAIN "ac-collector-attestation-v2"
 
 static bool ac_attestation_parse_hex_wide(
     const wchar_t *text,
@@ -145,10 +145,13 @@ static bool ac_attestation_read_file(
 bool ac_collector_attest(
     const wchar_t *challenge_id,
     const wchar_t *nonce,
+    const wchar_t *server_session_id,
     AcCollectorAttestation *result)
 {
     uint8_t challenge_bytes[AC_ATTESTATION_CHALLENGE_BYTES];
     uint8_t nonce_bytes[AC_SHA256_DIGEST_SIZE];
+    uint8_t session_bytes[16];
+    char session_canonical[33];
     char nonce_canonical[AC_SHA256_HEX_SIZE];
     uint8_t *file_data = NULL;
     size_t file_size = 0;
@@ -167,6 +170,7 @@ bool ac_collector_attest(
     MODULEINFO module_info;
     uint16_t section_index;
     bool success = false;
+    const size_t version_length = strlen(AC_AGENT_VERSION);
 
     if (result == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -182,7 +186,13 @@ bool ac_collector_attest(
             nonce,
             sizeof(nonce_bytes),
             nonce_bytes,
-            nonce_canonical)) {
+            nonce_canonical) ||
+        !ac_attestation_parse_hex_wide(
+            server_session_id,
+            sizeof(session_bytes),
+            session_bytes,
+            session_canonical) ||
+        version_length == 0 || version_length > UINT8_MAX) {
         SetLastError(ERROR_INVALID_DATA);
         return false;
     }
@@ -331,6 +341,18 @@ bool ac_collector_attest(
     ac_sha256_final(&expected_hash, expected_digest);
     ac_sha256_final(&observed_hash, observed_digest);
     ac_sha256_to_hex(file_digest, result->file_sha256);
+    (void)strcpy_s(
+        result->server_session_id,
+        sizeof(result->server_session_id),
+        session_canonical);
+    (void)strcpy_s(
+        result->collector_version,
+        sizeof(result->collector_version),
+        AC_AGENT_VERSION);
+    (void)strcpy_s(
+        result->collector_build_id,
+        sizeof(result->collector_build_id),
+        result->file_sha256);
     ac_sha256_to_hex(expected_digest, result->expected_mapped_sha256);
     ac_sha256_to_hex(observed_digest, result->observed_mapped_sha256);
 
@@ -341,6 +363,16 @@ bool ac_collector_attest(
         sizeof(AC_ATTESTATION_DOMAIN) - 1u);
     ac_sha256_update(&response_hash, challenge_bytes, sizeof(challenge_bytes));
     ac_sha256_update(&response_hash, nonce_bytes, sizeof(nonce_bytes));
+    ac_sha256_update(&response_hash, session_bytes, sizeof(session_bytes));
+    {
+        const uint8_t version_length_byte = (uint8_t)version_length;
+        ac_sha256_update(
+            &response_hash,
+            &version_length_byte,
+            sizeof(version_length_byte));
+    }
+    ac_sha256_update(&response_hash, AC_AGENT_VERSION, version_length);
+    ac_sha256_update(&response_hash, file_digest, sizeof(file_digest));
     ac_sha256_update(&response_hash, file_digest, sizeof(file_digest));
     ac_sha256_update(&response_hash, observed_digest, sizeof(observed_digest));
     ac_sha256_final(&response_hash, response_digest);
@@ -350,6 +382,7 @@ bool ac_collector_attest(
 
 cleanup:
     SecureZeroMemory(nonce_bytes, sizeof(nonce_bytes));
+    SecureZeroMemory(session_bytes, sizeof(session_bytes));
     SecureZeroMemory(nonce_canonical, sizeof(nonce_canonical));
     free(path);
     free(file_data);
@@ -371,6 +404,8 @@ void ac_log_collector_attestation(
         details,
         sizeof(details),
         "{\"scan_id\":%" PRIu64 ",\"challenge_id\":\"%s\","
+        "\"server_session_id\":\"%s\",\"collector_version\":\"%s\","
+        "\"collector_build_id\":\"%s\","
         "\"nonce_sha256\":\"%s\",\"file_sha256\":\"%s\","
         "\"expected_mapped_sha256\":\"%s\","
         "\"observed_mapped_sha256\":\"%s\","
@@ -380,6 +415,9 @@ void ac_log_collector_attestation(
         "\"normalization\":\"pe_relocations_iat_unbacked_masked_v1\"}",
         scan_id,
         result->challenge_id,
+        result->server_session_id,
+        result->collector_version,
+        result->collector_build_id,
         result->nonce_sha256,
         result->file_sha256,
         result->expected_mapped_sha256,

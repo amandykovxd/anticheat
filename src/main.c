@@ -6,6 +6,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "schedule.h"
+
 #define AC_EXIT_OK 0
 #define AC_EXIT_USAGE 2
 #define AC_EXIT_LOG_FAILURE 3
@@ -20,6 +22,8 @@ typedef struct AcOptions {
     size_t extra_root_count;
     DWORD pid;
     DWORD interval_ms;
+    DWORD interval_min_ms;
+    DWORD interval_max_ms;
     DWORD wait_timeout_ms;
     uint64_t max_log_bytes;
     uint64_t repeat_interval_ms;
@@ -39,37 +43,40 @@ typedef struct AcOptions {
     bool require_manifest;
     const wchar_t *attestation_challenge;
     const wchar_t *attestation_nonce;
+    const wchar_t *attestation_session;
     bool require_attestation;
     bool require_secure_kernel;
     AcDispatchWatch dispatch_watches[AC_MAX_DISPATCH_WATCHES];
     size_t dispatch_watch_count;
 } AcOptions;
 
-static DWORD ac_jittered_interval(DWORD interval_ms)
+static DWORD ac_randomized_interval(
+    DWORD minimum_ms,
+    DWORD maximum_ms,
+    bool *random_available_out)
 {
-    uint32_t random_value = 0;
-    const DWORD spread = interval_ms / 5u;
-    uint64_t candidate;
+    uint64_t random_value = 0;
 
-    if (spread == 0 ||
-        BCryptGenRandom(
+    if (random_available_out != NULL) {
+        *random_available_out = false;
+    }
+    if (minimum_ms > maximum_ms) {
+        return minimum_ms;
+    }
+    if (BCryptGenRandom(
             NULL,
             (PUCHAR)&random_value,
             (ULONG)sizeof(random_value),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        return interval_ms;
+        return minimum_ms;
     }
-
-    candidate =
-        (uint64_t)interval_ms - spread +
-        ((uint64_t)random_value % ((uint64_t)spread * 2u + 1u));
-    if (candidate < 1000u) {
-        candidate = 1000u;
+    if (random_available_out != NULL) {
+        *random_available_out = true;
     }
-    if (candidate > 3600000u) {
-        candidate = 3600000u;
-    }
-    return (DWORD)candidate;
+    return ac_schedule_delay_from_random(
+        minimum_ms,
+        maximum_ms,
+        random_value);
 }
 
 static HANDLE g_stop_event = NULL;
@@ -114,6 +121,8 @@ static void ac_print_usage(const wchar_t *program)
         L"\n"
         L"Scanning:\n"
         L"  --interval-ms <n>         scan period, 1000..3600000 (default 5000)\n"
+        L"  --interval-min-ms <n>     minimum randomized delay (default 4000)\n"
+        L"  --interval-max-ms <n>     maximum randomized delay (default 6000)\n"
         L"  --once                    perform a single scan and exit\n"
         L"  --allow-root <dir>        additional trusted module root (repeatable)\n"
         L"  --scan-budget-ms <n>      warn when one scan exceeds this (default 250)\n"
@@ -132,6 +141,7 @@ static void ac_print_usage(const wchar_t *program)
         L"  --require-manifest        fail when the pinned manifest is unavailable\n"
         L"  --attestation-challenge <id>  server challenge id (32 hex)\n"
         L"  --attestation-nonce <hex>     server nonce (64 hex)\n"
+        L"  --attestation-session <id>    reserved server session id (32 hex)\n"
         L"  --require-attestation     fail on missing or inconsistent self-attestation\n"
         L"\n"
         L"Kernel telemetry:\n"
@@ -174,9 +184,11 @@ static bool ac_print_attestation_digest(void)
         L"00000000000000000000000000000000";
     static const wchar_t nonce[] =
         L"0000000000000000000000000000000000000000000000000000000000000000";
+    static const wchar_t session[] =
+        L"00000000000000000000000000000000";
     AcCollectorAttestation result;
 
-    if (!ac_collector_attest(challenge, nonce, &result)) {
+    if (!ac_collector_attest(challenge, nonce, session, &result)) {
         fwprintf(
             stderr,
             L"Cannot calculate collector attestation identity: %lu\n",
@@ -242,6 +254,8 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
 
     memset(options, 0, sizeof(*options));
     options->interval_ms = 5000u;
+    options->interval_min_ms = 4000u;
+    options->interval_max_ms = 6000u;
     options->log_path = L"anticheat-events.jsonl";
     options->max_log_bytes = 32ull * 1024ull * 1024ull;
     options->log_generations = 5u;
@@ -331,6 +345,9 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         } else if (wcscmp(argument, L"--attestation-nonce") == 0 &&
                    has_value) {
             options->attestation_nonce = argv[++index];
+        } else if (wcscmp(argument, L"--attestation-session") == 0 &&
+                   has_value) {
+            options->attestation_session = argv[++index];
         } else if (wcscmp(argument, L"--require-attestation") == 0) {
             options->require_attestation = true;
         } else if (wcscmp(argument, L"--process") == 0 && has_value) {
@@ -352,6 +369,24 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
                 return false;
             }
             options->interval_ms = (DWORD)number;
+            options->interval_min_ms = (DWORD)(number - number / 5u);
+            options->interval_max_ms = (DWORD)(number + number / 5u);
+            if (options->interval_min_ms < 1000u) {
+                options->interval_min_ms = 1000u;
+            }
+            if (options->interval_max_ms > 3600000u) {
+                options->interval_max_ms = 3600000u;
+            }
+        } else if (wcscmp(argument, L"--interval-min-ms") == 0 && has_value) {
+            if (!ac_parse_u64(argv[++index], 1000u, 3600000u, &number)) {
+                return false;
+            }
+            options->interval_min_ms = (DWORD)number;
+        } else if (wcscmp(argument, L"--interval-max-ms") == 0 && has_value) {
+            if (!ac_parse_u64(argv[++index], 1000u, 3600000u, &number)) {
+                return false;
+            }
+            options->interval_max_ms = (DWORD)number;
         } else if (wcscmp(argument, L"--wait-timeout-ms") == 0 && has_value) {
             if (!ac_parse_u64(argv[++index], 0u, 86400000u, &number)) {
                 return false;
@@ -382,11 +417,14 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
         }
     }
 
-    if ((options->manifest_path == NULL) !=
+    if (options->interval_min_ms > options->interval_max_ms ||
+        (options->manifest_path == NULL) !=
             (options->manifest_sha256 == NULL) ||
         (options->require_manifest && options->manifest_path == NULL) ||
         (options->attestation_challenge == NULL) !=
             (options->attestation_nonce == NULL) ||
+        (options->attestation_challenge == NULL) !=
+            (options->attestation_session == NULL) ||
         (options->require_attestation &&
          options->attestation_challenge == NULL) ||
         (options->attestation_challenge != NULL &&
@@ -395,7 +433,8 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
               AC_ATTESTATION_CHALLENGE_HEX_SIZE - 1u) ||
           !ac_wide_hex_length(
               options->attestation_nonce,
-              AC_SHA256_HEX_SIZE - 1u)))) {
+              AC_SHA256_HEX_SIZE - 1u) ||
+          !ac_wide_hex_length(options->attestation_session, 32u)))) {
         return false;
     }
     if (options->pid != 0) {
@@ -631,6 +670,7 @@ int wmain(int argc, wchar_t **argv)
     bool kernel_telemetry_complete = true;
     bool manifest_ready = false;
     bool attestation_complete = false;
+    bool schedule_random_failure_reported = false;
     int exit_code = AC_EXIT_INTERNAL;
 
     options = (AcOptions *)calloc(1u, sizeof(*options));
@@ -700,7 +740,8 @@ int wmain(int argc, wchar_t **argv)
         sizeof(details),
         "{\"agent\":\"%s\",\"version\":\"%s\",\"schema\":%u,\"mode\":\"%s\","
         "\"memory_write_access\":false,\"terminates_target\":false,"
-        "\"interval_ms\":%lu,\"once\":%s,\"scan_budget_ms\":%" PRIu64 ","
+        "\"interval_ms\":%lu,\"interval_min_ms\":%lu,"
+        "\"interval_max_ms\":%lu,\"once\":%s,\"scan_budget_ms\":%" PRIu64 ","
         "\"repeat_interval_ms\":%" PRIu64 ",\"pointer_bits\":%zu}",
         AC_AGENT_NAME,
         AC_AGENT_VERSION,
@@ -709,6 +750,8 @@ int wmain(int argc, wchar_t **argv)
             ? "hybrid_kernel_user_telemetry"
             : "user_telemetry",
         (unsigned long)options->interval_ms,
+        (unsigned long)options->interval_min_ms,
+        (unsigned long)options->interval_max_ms,
         options->once ? "true" : "false",
         options->scan_budget_ms,
         options->repeat_interval_ms,
@@ -720,6 +763,7 @@ int wmain(int argc, wchar_t **argv)
         if (!ac_collector_attest(
                 options->attestation_challenge,
                 options->attestation_nonce,
+                options->attestation_session,
                 &attestation)) {
             ac_log_win32_error_severity(
                 &logger,
@@ -1070,6 +1114,7 @@ int wmain(int argc, wchar_t **argv)
             if (!ac_collector_attest(
                     options->attestation_challenge,
                     options->attestation_nonce,
+                    options->attestation_session,
                     &attestation)) {
                 attestation_complete = false;
                 ac_log_win32_error_severity(
@@ -1158,9 +1203,26 @@ int wmain(int argc, wchar_t **argv)
         }
 
         {
+            bool schedule_random_available = false;
+            const DWORD scan_delay = ac_randomized_interval(
+                options->interval_min_ms,
+                options->interval_max_ms,
+                &schedule_random_available);
             const ULONGLONG deadline =
-                GetTickCount64() + ac_jittered_interval(options->interval_ms);
+                GetTickCount64() + scan_delay;
             bool next_scan = false;
+
+            if (!schedule_random_available &&
+                !schedule_random_failure_reported) {
+                ac_log_event(
+                    &logger,
+                    AC_SEVERITY_HIGH,
+                    "scan_schedule_random_source_unavailable",
+                    target.pid,
+                    "{\"fallback\":\"minimum_interval\","
+                    "\"fails_early\":true}");
+                schedule_random_failure_reported = true;
+            }
 
             wait_handles[0] = target.process;
             wait_handles[1] = g_stop_event;
@@ -1257,8 +1319,15 @@ int wmain(int argc, wchar_t **argv)
             break;
         }
         if (wait_result == WAIT_FAILED) {
+            bool schedule_random_available = false;
             ac_log_win32_error(&logger, "wait_failed", target.pid, GetLastError());
-            Sleep(ac_jittered_interval(options->interval_ms));
+            Sleep(ac_randomized_interval(
+                options->interval_min_ms,
+                options->interval_max_ms,
+                &schedule_random_available));
+            if (!schedule_random_available) {
+                schedule_random_failure_reported = true;
+            }
         }
     }
 

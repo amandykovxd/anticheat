@@ -133,6 +133,8 @@ Fields:
 
 - `scan_id`;
 - `challenge_id`: 32-character server challenge identifier;
+- `server_session_id`: challenge-reserved 32-character server session;
+- `collector_version` and immutable `collector_build_id`;
 - `nonce_sha256`: digest of the nonce; the nonce itself is never logged;
 - `file_sha256`;
 - `expected_mapped_sha256`;
@@ -144,9 +146,11 @@ Fields:
 - `normalization`: `pe_relocations_iat_unbacked_masked_v1`.
 
 The response is
-`SHA256("ac-collector-attestation-v1" || challenge_id || nonce ||
-file_sha256 || observed_mapped_sha256)`, where all values after the domain are
-decoded bytes. The reference receiver compares file and normalized mapped
+`SHA256("ac-collector-attestation-v2" || challenge_id || nonce ||
+server_session_id || version_length_u8 || collector_version ||
+collector_build_id || file_sha256 || observed_mapped_sha256)`, where hash and
+identifier values after the domain are decoded bytes. The reference receiver
+compares the version, build, file, and normalized mapped
 digests to its configured signed-release identity and consumes each challenge
 for one session. This remains software attestation and does not survive a
 fully hostile kernel.
@@ -566,6 +570,11 @@ Fields:
 | `integrity_modules_skipped` | unsigned integer |
 | `integrity_file_changes` | unsigned integer |
 | `region_events_omitted` | unsigned integer |
+| `coverage_epoch` | unsigned integer |
+| `coverage_epoch_regions_visited` | unsigned integer |
+| `coverage_oldest_unvisited_ms` | unsigned integer |
+| `regions_deferred` | unsigned integer lower bound |
+| `random_source_available` | boolean |
 | `region_scan_truncated` | boolean |
 | `integrity_bytes` | unsigned integer |
 | `integrity_baselines` | unsigned integer |
@@ -592,6 +601,8 @@ prevents a structurally complete scan. Fields:
 - `module_snapshot_empty`;
 - `region_scan_truncated`;
 - `region_events_omitted`;
+- `coverage_epoch`, `coverage_epoch_regions_visited`,
+  `coverage_oldest_unvisited_ms`, and `regions_deferred`;
 - `query_failures`;
 - `read_failures`;
 - `integrity_disabled`;
@@ -601,6 +612,24 @@ prevents a structurally complete scan. Fields:
 - `integrity_modules_skipped`;
 - `possible_user_mode_api_interference`;
 - `reason`: `scan_coverage_incomplete`.
+
+Region traversal starts at a CSPRNG-selected address and retains a cursor across
+bounded scans. It completes the current address-space epoch before selecting a
+new random start. Finding emission uses a persistent cyclic window, so a stable
+finding omitted by the 64-event cap is visited in a later window instead of
+being permanently displaced by lower-address decoys. Cursor and seed values
+are intentionally not exposed.
+
+### `scan_random_source_unavailable`
+
+Severity: `high`. The collector could not obtain CSPRNG bytes for coverage
+ordering. Scanning continues with bounded deterministic continuation and the
+session exposes `random_source_available:false`.
+
+### `scan_schedule_random_source_unavailable`
+
+Severity: `high`. Schedule randomization failed and the collector uses the
+configured minimum delay, causing an earlier scan rather than a coverage gap.
 
 ### `scan_budget_exceeded`
 

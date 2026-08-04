@@ -33,6 +33,7 @@ from transport_common import (
     require_string,
     verify_batch_records,
 )
+from correlation_rules import CorrelationEngine, CorrelationError
 
 
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
@@ -40,8 +41,21 @@ MAX_BATCH_RECORDS = 512
 SESSION_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})$")
 BATCH_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/batches$")
 HEARTBEAT_PATH = re.compile(r"^/v1/sessions/([0-9a-f]{32})/heartbeat$")
+SESSION_DECISIONS_PATH = re.compile(
+    r"^/v1/sessions/([0-9a-f]{32})/decisions$"
+)
+RULE_PATH = re.compile(r"^/v1/rules/([a-z][a-z0-9_.-]{2,63})$")
+RULE_PROMOTE_PATH = re.compile(
+    r"^/v1/rules/([a-z][a-z0-9_.-]{2,63})/promote$"
+)
+RULE_ROLLBACK_PATH = re.compile(
+    r"^/v1/rules/([a-z][a-z0-9_.-]{2,63})/rollback$"
+)
+DECISION_FEEDBACK_PATH = re.compile(
+    r"^/v1/decisions/([0-9a-f]{64})/feedback$"
+)
 ATTESTATION_CHALLENGE_PATH = "/v1/attestations/challenges"
-ATTESTATION_DOMAIN = b"ac-collector-attestation-v1"
+ATTESTATION_DOMAIN = b"ac-collector-attestation-v2"
 ATTESTATION_CHALLENGE_BYTES = 16
 ATTESTATION_NONCE_BYTES = 32
 
@@ -82,7 +96,7 @@ class ReceiverStore:
         self,
         database: str | Path,
         heartbeat_interval_ms: int = 15_000,
-        trusted_collectors: dict[str, tuple[str, str]] | None = None,
+        trusted_collectors: dict[str, tuple[str, ...]] | None = None,
         attestation_ttl_ms: int = 300_000,
     ):
         self.database = str(database)
@@ -153,6 +167,7 @@ class ReceiverStore:
                     challenge_id TEXT PRIMARY KEY,
                     collector_id TEXT NOT NULL,
                     nonce TEXT NOT NULL,
+                    reserved_session_id TEXT,
                     expires_at_ms INTEGER NOT NULL,
                     consumed_session_id TEXT,
                     validated_at_ms INTEGER,
@@ -174,6 +189,18 @@ class ReceiverStore:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN attestation_challenge_id TEXT"
                 )
+            challenge_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(attestation_challenges)"
+                ).fetchall()
+            }
+            if "reserved_session_id" not in challenge_columns:
+                connection.execute(
+                    "ALTER TABLE attestation_challenges "
+                    "ADD COLUMN reserved_session_id TEXT"
+                )
+            CorrelationEngine.initialize(connection)
 
     def create_attestation_challenge(
         self, request: dict[str, Any]
@@ -196,19 +223,29 @@ class ReceiverStore:
         now = _now_ms()
         challenge_id = secrets.token_hex(ATTESTATION_CHALLENGE_BYTES)
         nonce = secrets.token_hex(ATTESTATION_NONCE_BYTES)
+        session_id = secrets.token_hex(16)
         expires_at_ms = now + self.attestation_ttl_ms
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO attestation_challenges (
-                    challenge_id, collector_id, nonce, expires_at_ms, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?)
+                    challenge_id, collector_id, nonce, reserved_session_id,
+                    expires_at_ms, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (challenge_id, collector_id, nonce, expires_at_ms, now),
+                (
+                    challenge_id,
+                    collector_id,
+                    nonce,
+                    session_id,
+                    expires_at_ms,
+                    now,
+                ),
             )
         return HTTPStatus.CREATED, {
             "challenge_id": challenge_id,
             "nonce": nonce,
+            "session_id": session_id,
             "expires_at_ms": expires_at_ms,
             "algorithm": "sha256",
         }
@@ -262,6 +299,24 @@ class ReceiverStore:
                 response_sha256 = require_sha256(
                     details.get("response_sha256"), "details.response_sha256"
                 )
+                attested_session_id = require_string(
+                    details.get("server_session_id"),
+                    "details.server_session_id",
+                    32,
+                )
+                if SESSION_ID_RE.fullmatch(attested_session_id) is None:
+                    raise ProtocolError(
+                        "details.server_session_id has an invalid format"
+                    )
+                collector_version = require_string(
+                    details.get("collector_version"),
+                    "details.collector_version",
+                    64,
+                )
+                collector_build_id = require_sha256(
+                    details.get("collector_build_id"),
+                    "details.collector_build_id",
+                )
                 if details.get("mapped_matches_disk") is not True:
                     raise ProtocolError("mapped collector image does not match disk")
                 if details.get("complete") is not True:
@@ -283,6 +338,17 @@ class ReceiverStore:
                     "collector_attestation_invalid",
                     "attestation challenge is unknown for this collector",
                 )
+            if (
+                challenge["reserved_session_id"] != session["session_id"]
+                or not hmac.compare_digest(
+                    attested_session_id, session["session_id"]
+                )
+            ):
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "collector_attestation_wrong_session",
+                    "attestation challenge is bound to a different server session",
+                )
             consumed = challenge["consumed_session_id"]
             if challenge["expires_at_ms"] < now and consumed is None:
                 raise ReceiverError(
@@ -290,14 +356,16 @@ class ReceiverStore:
                     "collector_attestation_expired",
                     "attestation challenge has expired",
                 )
-            if consumed is not None and consumed != session["session_id"]:
+            if consumed is not None:
                 raise ReceiverError(
                     HTTPStatus.CONFLICT,
                     "collector_attestation_replayed",
-                    "attestation challenge was consumed by another session",
+                    "attestation challenge was already consumed",
                 )
 
-            trusted_file, trusted_mapped = trusted
+            trusted_file, trusted_mapped = trusted[:2]
+            trusted_version = trusted[2] if len(trusted) >= 3 else "0.4.0"
+            trusted_build_id = trusted[3] if len(trusted) >= 4 else trusted_file
             expected_nonce_digest = hashlib.sha256(
                 bytes.fromhex(challenge["nonce"])
             ).hexdigest()
@@ -305,11 +373,17 @@ class ReceiverStore:
                 ATTESTATION_DOMAIN
                 + bytes.fromhex(challenge_id)
                 + bytes.fromhex(challenge["nonce"])
+                + bytes.fromhex(session["session_id"])
+                + bytes([len(collector_version.encode("utf-8"))])
+                + collector_version.encode("utf-8")
+                + bytes.fromhex(collector_build_id)
                 + bytes.fromhex(file_sha256)
                 + bytes.fromhex(observed_mapped)
             ).hexdigest()
             identity_matches = (
                 hmac.compare_digest(file_sha256, trusted_file)
+                and hmac.compare_digest(collector_version, trusted_version)
+                and hmac.compare_digest(collector_build_id, trusted_build_id)
                 and hmac.compare_digest(expected_mapped, trusted_mapped)
                 and hmac.compare_digest(observed_mapped, trusted_mapped)
                 and hmac.compare_digest(expected_mapped, observed_mapped)
@@ -388,6 +462,14 @@ class ReceiverStore:
             if chain_algorithm != CHAIN_ALGORITHM:
                 raise ProtocolError("chain_algorithm must be sha256")
             chain_seed = require_sha256(request.get("chain_seed"), "chain_seed")
+            requested_session_id_value = request.get("requested_session_id")
+            requested_session_id = None
+            if requested_session_id_value is not None:
+                requested_session_id = require_string(
+                    requested_session_id_value, "requested_session_id", 32
+                )
+                if SESSION_ID_RE.fullmatch(requested_session_id) is None:
+                    raise ProtocolError("requested_session_id has an invalid format")
         except ProtocolError as error:
             raise ReceiverError(
                 HTTPStatus.BAD_REQUEST, "request_invalid", str(error)
@@ -418,7 +500,35 @@ class ReceiverStore:
                 response["heartbeat_interval_ms"] = self.heartbeat_interval_ms
                 return HTTPStatus.OK, response
 
-            session_id = secrets.token_hex(16)
+            if requested_session_id is not None:
+                reservation = connection.execute(
+                    """
+                    SELECT collector_id, expires_at_ms, consumed_session_id
+                      FROM attestation_challenges
+                     WHERE reserved_session_id = ?
+                    """,
+                    (requested_session_id,),
+                ).fetchone()
+                if (
+                    reservation is None
+                    or reservation["collector_id"] != collector_id
+                    or reservation["expires_at_ms"] < now
+                    or reservation["consumed_session_id"] is not None
+                ):
+                    raise ReceiverError(
+                        HTTPStatus.CONFLICT,
+                        "session_reservation_invalid",
+                        "requested server session is absent, expired, or already used",
+                    )
+                session_id = requested_session_id
+            else:
+                if collector_id in self.trusted_collectors:
+                    raise ReceiverError(
+                        HTTPStatus.CONFLICT,
+                        "attestation_session_required",
+                        "trusted collectors must use a challenge-reserved session",
+                    )
+                session_id = secrets.token_hex(16)
             connection.execute(
                 """
                 INSERT INTO sessions (
@@ -567,6 +677,10 @@ class ReceiverStore:
                 )
 
             self._validate_attestations(connection, session, verified, now)
+            session = self._load_session(connection, session_id)
+            CorrelationEngine.retain_and_correlate(
+                connection, session, verified, now
+            )
 
             connection.execute(
                 """
@@ -733,7 +847,43 @@ class ReceiverStore:
                 "attestation_required": row["collector_id"] in self.trusted_collectors,
                 "attestation_verified": bool(row["attestation_verified"]),
                 "attestation_challenge_id": row["attestation_challenge_id"],
+                "correlation_decisions": len(
+                    CorrelationEngine.decisions(connection, session_id)
+                ),
             }
+
+    def install_rule(self, definition: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return CorrelationEngine.install_rule(connection, definition)
+
+    def promote_rule(self, rule_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return CorrelationEngine.promote_rule(connection, rule_id)
+
+    def rollback_rule(self, rule_id: str, version: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return CorrelationEngine.rollback_rule(connection, rule_id, version)
+
+    def record_decision_feedback(
+        self, decision_id: str, false_positive: bool
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            CorrelationEngine.record_feedback(
+                connection, decision_id, false_positive
+            )
+
+    def rule_status(self, rule_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            return CorrelationEngine.rule_status(connection, rule_id)
+
+    def correlation_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            self._load_session(connection, session_id)
+            return CorrelationEngine.decisions(connection, session_id)
 
 
 class ReceiverHttpServer(ThreadingHTTPServer):
@@ -842,6 +992,36 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._require_authentication():
             return
+        decisions_match = SESSION_DECISIONS_PATH.fullmatch(self.path)
+        rule_match = RULE_PATH.fullmatch(self.path)
+        if decisions_match is not None:
+            try:
+                self._write_json(
+                    HTTPStatus.OK,
+                    {
+                        "decisions": self.server.store.correlation_decisions(
+                            decisions_match.group(1)
+                        )
+                    },
+                )
+            except ReceiverError as error:
+                self._write_error(error)
+            return
+        if rule_match is not None:
+            try:
+                self._write_json(
+                    HTTPStatus.OK,
+                    self.server.store.rule_status(rule_match.group(1)),
+                )
+            except CorrelationError as error:
+                self._write_error(
+                    ReceiverError(
+                        HTTPStatus.NOT_FOUND,
+                        "correlation_rule_not_found",
+                        str(error),
+                    )
+                )
+            return
         match = SESSION_PATH.fullmatch(self.path)
         if match is None:
             self._write_json(
@@ -867,9 +1047,15 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                 )
             elif self.path == "/v1/sessions":
                 status, response = self.server.store.create_session(request)
+            elif self.path == "/v1/rules":
+                response = self.server.store.install_rule(request)
+                status = HTTPStatus.CREATED
             else:
                 batch_match = BATCH_PATH.fullmatch(self.path)
                 heartbeat_match = HEARTBEAT_PATH.fullmatch(self.path)
+                promote_match = RULE_PROMOTE_PATH.fullmatch(self.path)
+                rollback_match = RULE_ROLLBACK_PATH.fullmatch(self.path)
+                feedback_match = DECISION_FEEDBACK_PATH.fullmatch(self.path)
                 if batch_match is not None:
                     status, response = self.server.store.append_batch(
                         batch_match.group(1), request
@@ -878,6 +1064,30 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
                     status, response = self.server.store.append_heartbeat(
                         heartbeat_match.group(1), request
                     )
+                elif promote_match is not None:
+                    response = self.server.store.promote_rule(
+                        promote_match.group(1)
+                    )
+                    status = HTTPStatus.OK
+                elif rollback_match is not None:
+                    version = require_integer(
+                        request.get("version"), "version", 1
+                    )
+                    response = self.server.store.rollback_rule(
+                        rollback_match.group(1), version
+                    )
+                    status = HTTPStatus.OK
+                elif feedback_match is not None:
+                    false_positive = request.get("false_positive")
+                    if not isinstance(false_positive, bool):
+                        raise ProtocolError(
+                            "false_positive must be a boolean"
+                        )
+                    self.server.store.record_decision_feedback(
+                        feedback_match.group(1), false_positive
+                    )
+                    response = {"accepted": True}
+                    status = HTTPStatus.ACCEPTED
                 else:
                     raise ReceiverError(
                         HTTPStatus.NOT_FOUND, "route_not_found", "route not found"
@@ -885,6 +1095,14 @@ class ReceiverRequestHandler(BaseHTTPRequestHandler):
             self._write_json(status, response)
         except ReceiverError as error:
             self._write_error(error)
+        except (CorrelationError, ProtocolError) as error:
+            self._write_error(
+                ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "correlation_request_invalid",
+                    str(error),
+                )
+            )
 
 
 def _parse_arguments() -> argparse.Namespace:
@@ -902,8 +1120,8 @@ def _parse_arguments() -> argparse.Namespace:
         "--trusted-collector",
         action="append",
         default=[],
-        metavar="ID:FILE_SHA256:MAPPED_SHA256",
-        help="trusted collector identity; may be repeated",
+        metavar="ID:FILE_SHA256:MAPPED_SHA256[:VERSION[:BUILD_SHA256]]",
+        help="trusted collector identity and release version; may be repeated",
     )
     parser.add_argument(
         "--allow-insecure-http",
@@ -935,15 +1153,28 @@ def main() -> int:
         print("TLS is required; supply --cert and --key", file=sys.stderr)
         return 2
 
-    trusted_collectors: dict[str, tuple[str, str]] = {}
+    trusted_collectors: dict[str, tuple[str, ...]] = {}
     try:
         for value in arguments.trusted_collector:
-            collector_id, file_digest, mapped_digest = value.split(":", 2)
+            parts = value.split(":")
+            if len(parts) < 3 or len(parts) > 5:
+                raise ValueError("expected 3 to 5 colon-separated fields")
+            collector_id, file_digest, mapped_digest = parts[:3]
+            collector_version = parts[3] if len(parts) >= 4 else "0.4.0"
+            build_digest = parts[4] if len(parts) >= 5 else file_digest
             if not collector_id or collector_id in trusted_collectors:
                 raise ValueError("collector ID is empty or duplicated")
+            if (
+                not collector_version
+                or len(collector_version.encode("utf-8")) > 64
+                or "\x00" in collector_version
+            ):
+                raise ValueError("collector version is empty or too long")
             trusted_collectors[collector_id] = (
                 require_sha256(file_digest, "file SHA-256"),
                 require_sha256(mapped_digest, "mapped SHA-256"),
+                collector_version,
+                require_sha256(build_digest, "build SHA-256"),
             )
     except (ValueError, ProtocolError) as error:
         print(f"invalid --trusted-collector: {error}", file=sys.stderr)

@@ -7,6 +7,8 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 
+#include "schedule.h"
+
 #define AC_MAX_REGION_EVENTS_PER_SCAN 64u
 #define AC_FILE_HASH_LIMIT (256ull * 1024ull * 1024ull)
 #define AC_FILE_HASH_CHUNK (64u * 1024u)
@@ -26,7 +28,7 @@ typedef struct AcRegionSample {
     AcRegionFinding finding;
 } AcRegionSample;
 
-static uint64_t ac_random_u64(uint64_t fallback)
+static uint64_t ac_random_u64(uint64_t fallback, bool *secure_out)
 {
     uint64_t value = 0;
 
@@ -35,11 +37,16 @@ static uint64_t ac_random_u64(uint64_t fallback)
             (PUCHAR)&value,
             (ULONG)sizeof(value),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        if (secure_out != NULL) {
+            *secure_out = false;
+        }
         value = fallback ^ GetTickCount64();
         value ^= value >> 12;
         value ^= value << 25;
         value ^= value >> 27;
         value *= UINT64_C(2685821657736338717);
+    } else if (secure_out != NULL) {
+        *secure_out = true;
     }
     return value;
 }
@@ -384,6 +391,7 @@ bool ac_context_init(AcContext *context, AcLogger *logger, const AcPolicy *polic
     memset(context, 0, sizeof(*context));
     context->logger = logger;
     context->policy = *policy;
+    context->coverage_random_source_available = true;
     ac_module_list_init(&context->modules);
     ac_range_index_init(&context->module_ranges);
     ac_integrity_cache_init(&context->integrity);
@@ -718,22 +726,98 @@ static void ac_scan_memory_regions(
 {
     SYSTEM_INFO system_info;
     uintptr_t address;
+    uintptr_t boundary;
+    uintptr_t minimum_address;
     uintptr_t maximum_address;
-    AcRegionSample samples[AC_MAX_REGION_EVENTS_PER_SCAN];
+    AcRegionSample *sample_storage;
+    AcRegionSample *samples;
+    AcRegionSample *prefix_samples;
     size_t sample_count = 0;
+    size_t prefix_count = 0;
     uint64_t suspicious_seen = 0;
+    uint64_t finding_start;
     size_t sample_index;
+    bool epoch_complete = false;
 
     GetNativeSystemInfo(&system_info);
-    address = (uintptr_t)system_info.lpMinimumApplicationAddress;
+    minimum_address = (uintptr_t)system_info.lpMinimumApplicationAddress;
     maximum_address = (uintptr_t)system_info.lpMaximumApplicationAddress;
+    if (minimum_address >= maximum_address || system_info.dwPageSize == 0) {
+        stats->query_failures = 1u;
+        return;
+    }
 
-    while (address < maximum_address) {
+    if (!context->region_cursor_initialized) {
+        bool secure = false;
+        bool all_secure;
+        const uint64_t random_value = ac_random_u64(scan_id, &secure);
+        const uint64_t address_span =
+            (uint64_t)(maximum_address - minimum_address);
+        uintptr_t anchor = minimum_address +
+            (uintptr_t)(random_value % address_span);
+
+        anchor -= anchor % (uintptr_t)system_info.dwPageSize;
+        if (anchor < minimum_address || anchor >= maximum_address) {
+            anchor = minimum_address;
+        }
+        context->region_cursor = anchor;
+        context->region_epoch_anchor = anchor;
+        context->region_epoch_wrapped = false;
+        context->region_cursor_initialized = true;
+        context->coverage_epoch = 1u;
+        context->coverage_epoch_started_ms = GetTickCount64();
+        all_secure = secure;
+        context->region_finding_cursor = ac_random_u64(
+            random_value ^ UINT64_C(0x9e3779b97f4a7c15),
+            &secure);
+        if (!secure || !all_secure) {
+            context->coverage_random_source_available = false;
+        }
+    }
+
+    if (context->region_cursor < minimum_address ||
+        context->region_cursor >= maximum_address ||
+        context->region_epoch_anchor < minimum_address ||
+        context->region_epoch_anchor >= maximum_address) {
+        context->region_cursor = minimum_address;
+        context->region_epoch_anchor = minimum_address;
+        context->region_epoch_wrapped = false;
+    }
+
+    sample_storage = (AcRegionSample *)calloc(
+        AC_MAX_REGION_EVENTS_PER_SCAN * 2u,
+        sizeof(*sample_storage));
+    if (sample_storage == NULL) {
+        stats->read_failures = 1u;
+        return;
+    }
+    samples = sample_storage;
+    prefix_samples = sample_storage + AC_MAX_REGION_EVENTS_PER_SCAN;
+    finding_start = context->region_finding_cursor;
+    address = context->region_cursor;
+
+    for (;;) {
         MEMORY_BASIC_INFORMATION memory;
         uintptr_t next_address;
 
+        boundary = context->region_epoch_wrapped
+            ? context->region_epoch_anchor
+            : maximum_address;
+        if (address >= boundary) {
+            if (!context->region_epoch_wrapped &&
+                context->region_epoch_anchor > minimum_address) {
+                address = minimum_address;
+                context->region_cursor = address;
+                context->region_epoch_wrapped = true;
+                continue;
+            }
+            epoch_complete = true;
+            break;
+        }
         if (stats->regions_visited >= context->policy.max_regions) {
             stats->region_scan_truncated = true;
+            stats->regions_deferred = 1u;
+            context->region_cursor = address;
             break;
         }
 
@@ -742,11 +826,13 @@ static void ac_scan_memory_regions(
             const DWORD error = GetLastError();
 
             if (error == ERROR_INVALID_PARAMETER) {
-                if (maximum_address - address >
+                if (boundary - address >
                     (uintptr_t)system_info.dwPageSize) {
                     ++stats->query_failures;
                 }
-                break;
+                address = boundary;
+                context->region_cursor = address;
+                continue;
             }
             ++stats->query_failures;
             if (error == ERROR_ACCESS_DENIED) {
@@ -757,10 +843,12 @@ static void ac_scan_memory_regions(
                 break;
             }
             address = next_address;
+            context->region_cursor = address;
             continue;
         }
 
         ++stats->regions_visited;
+        ++context->coverage_epoch_regions_visited;
 
         if ((uintptr_t)memory.RegionSize > UINTPTR_MAX - (uintptr_t)memory.BaseAddress) {
             break;
@@ -768,6 +856,9 @@ static void ac_scan_memory_regions(
         next_address = (uintptr_t)memory.BaseAddress + (uintptr_t)memory.RegionSize;
         if (next_address <= address) {
             break;
+        }
+        if (next_address > boundary) {
+            next_address = boundary;
         }
 
         if (memory.State == MEM_COMMIT &&
@@ -782,31 +873,46 @@ static void ac_scan_memory_regions(
             ++stats->executable_region_count;
 
             if (ac_classify_region(&memory, backed, &finding)) {
-                size_t selected;
+                const uint64_t finding_index = suspicious_seen;
 
                 ++stats->suspicious_region_count;
                 ++suspicious_seen;
 
-                if (sample_count < AC_MAX_REGION_EVENTS_PER_SCAN) {
-                    selected = sample_count++;
-                } else {
-                    selected = (size_t)(ac_random_u64(
-                        (uint64_t)(uintptr_t)memory.BaseAddress) % suspicious_seen);
-                    if (selected >= AC_MAX_REGION_EVENTS_PER_SCAN) {
-                        address = next_address;
-                        continue;
-                    }
+                if (finding_index < finding_start &&
+                    prefix_count < AC_MAX_REGION_EVENTS_PER_SCAN) {
+                    prefix_samples[prefix_count].memory = memory;
+                    prefix_samples[prefix_count].finding = finding;
+                    ++prefix_count;
                 }
-                samples[selected].memory = memory;
-                samples[selected].finding = finding;
+                if (finding_index >= finding_start &&
+                    sample_count < AC_MAX_REGION_EVENTS_PER_SCAN) {
+                    samples[sample_count].memory = memory;
+                    samples[sample_count].finding = finding;
+                    ++sample_count;
+                }
             }
         }
 
         address = next_address;
+        context->region_cursor = address;
     }
 
+    for (sample_index = 0;
+         sample_count < AC_MAX_REGION_EVENTS_PER_SCAN &&
+         sample_index < prefix_count;
+         ++sample_index) {
+        samples[sample_count++] = prefix_samples[sample_index];
+    }
     if (suspicious_seen > sample_count) {
         stats->region_events_omitted = (size_t)(suspicious_seen - sample_count);
+    }
+    if (suspicious_seen > 0) {
+        const uint64_t effective_start = finding_start < suspicious_seen
+            ? finding_start : 0;
+        context->region_finding_cursor =
+            (effective_start + sample_count) % suspicious_seen;
+    } else {
+        context->region_finding_cursor = 0;
     }
     for (sample_index = 0; sample_index < sample_count; ++sample_index) {
         ac_probe_region(
@@ -823,6 +929,41 @@ static void ac_scan_memory_regions(
             &samples[sample_index].finding,
             stats);
     }
+
+    stats->coverage_epoch = context->coverage_epoch;
+    stats->coverage_epoch_regions_visited =
+        context->coverage_epoch_regions_visited;
+    stats->coverage_oldest_unvisited_ms =
+        GetTickCount64() - context->coverage_epoch_started_ms;
+    stats->coverage_random_source_available =
+        context->coverage_random_source_available;
+
+    if (epoch_complete) {
+        bool secure = false;
+        const uint64_t random_value = ac_random_u64(
+            scan_id ^ context->coverage_epoch,
+            &secure);
+        const uint64_t address_span =
+            (uint64_t)(maximum_address - minimum_address);
+        uintptr_t next_anchor = minimum_address +
+            (uintptr_t)(random_value % address_span);
+
+        next_anchor -= next_anchor % (uintptr_t)system_info.dwPageSize;
+        if (next_anchor < minimum_address || next_anchor >= maximum_address) {
+            next_anchor = minimum_address;
+        }
+        if (!secure) {
+            context->coverage_random_source_available = false;
+            stats->coverage_random_source_available = false;
+        }
+        ++context->coverage_epoch;
+        context->coverage_epoch_started_ms = GetTickCount64();
+        context->coverage_epoch_regions_visited = 0;
+        context->region_epoch_anchor = next_anchor;
+        context->region_cursor = next_anchor;
+        context->region_epoch_wrapped = false;
+    }
+    free(sample_storage);
 }
 
 static const wchar_t *ac_module_base_name(const wchar_t *path)
@@ -1159,21 +1300,51 @@ bool ac_scan_process(
     ac_range_index_finalize(&context->module_ranges);
 
     stats.module_count = context->modules.count;
-    for (index = 0; index < context->modules.count; ++index) {
-        const AcModule *module = &context->modules.items[index];
+    if (context->modules.count > 0) {
+        bool secure = false;
+        const uint64_t random_value = ac_random_u64(scan_id, &secure);
+        const size_t module_start =
+            (size_t)(random_value % context->modules.count);
+        const size_t module_step = ac_schedule_coprime_step(
+            context->modules.count,
+            random_value >> 17u);
 
-        if (ac_path_is_under_any(
-                module->path,
-                context->policy.allow_roots,
-                context->policy.allow_root_count)) {
-            continue;
+        if (!secure) {
+            context->coverage_random_source_available = false;
         }
+        for (index = 0; index < context->modules.count; ++index) {
+            const size_t module_index = ac_schedule_permutation_index(
+                index,
+                context->modules.count,
+                module_start,
+                module_step);
+            const AcModule *module = &context->modules.items[module_index];
 
-        ++stats.modules_outside_roots;
-        ac_report_module(context, target->pid, scan_id, module, &stats);
+            if (ac_path_is_under_any(
+                    module->path,
+                    context->policy.allow_roots,
+                    context->policy.allow_root_count)) {
+                continue;
+            }
+
+            ++stats.modules_outside_roots;
+            ac_report_module(context, target->pid, scan_id, module, &stats);
+        }
     }
 
     ac_scan_memory_regions(context, target, scan_id, &stats);
+    if (!context->coverage_random_source_available &&
+        !context->coverage_random_failure_reported) {
+        ac_log_event(
+            context->logger,
+            AC_SEVERITY_HIGH,
+            "scan_random_source_unavailable",
+            target->pid,
+            "{\"fallback\":\"bounded_early_scan_and_deterministic_continuation\","
+            "\"coverage_continues\":true}");
+        context->coverage_random_failure_reported = true;
+        ++stats.emitted;
+    }
     ac_scan_dispatch_watches(context, target, scan_id, &stats);
     ac_verify_module_integrity(context, target, scan_id, &stats);
 
@@ -1203,6 +1374,10 @@ bool ac_scan_process(
             "{\"scan_id\":%" PRIu64 ",\"module_list_truncated\":%s,"
             "\"module_snapshot_empty\":%s,"
             "\"region_scan_truncated\":%s,\"region_events_omitted\":%zu,"
+            "\"coverage_epoch\":%" PRIu64
+            ",\"coverage_epoch_regions_visited\":%" PRIu64
+            ",\"coverage_oldest_unvisited_ms\":%" PRIu64
+            ",\"regions_deferred\":%zu,"
             "\"query_failures\":%zu,\"read_failures\":%zu,"
             "\"integrity_disabled\":%s,"
             "\"integrity_modules_unavailable\":%zu,"
@@ -1217,6 +1392,10 @@ bool ac_scan_process(
             context->modules.count == 0 ? "true" : "false",
             stats.region_scan_truncated ? "true" : "false",
             stats.region_events_omitted,
+            stats.coverage_epoch,
+            stats.coverage_epoch_regions_visited,
+            stats.coverage_oldest_unvisited_ms,
+            stats.regions_deferred,
             stats.query_failures,
             stats.read_failures,
             context->policy.verify_module_integrity ? "false" : "true",
@@ -1257,6 +1436,10 @@ bool ac_scan_process(
         "\"integrity_export_slots_checked\":%zu,\"integrity_export_hooks\":%zu,"
         "\"integrity_modules_partial\":%zu,\"integrity_modules_skipped\":%zu,"
         "\"integrity_file_changes\":%zu,\"region_events_omitted\":%zu,"
+        "\"coverage_epoch\":%" PRIu64
+        ",\"coverage_epoch_regions_visited\":%" PRIu64
+        ",\"coverage_oldest_unvisited_ms\":%" PRIu64
+        ",\"regions_deferred\":%zu,\"random_source_available\":%s,"
         "\"dispatch_slots_checked\":%zu,"
         "\"dispatch_targets_suspicious\":%zu,"
         "\"dispatch_targets_unavailable\":%zu,"
@@ -1292,6 +1475,11 @@ bool ac_scan_process(
         stats.integrity_modules_skipped,
         stats.integrity_file_changes,
         stats.region_events_omitted,
+        stats.coverage_epoch,
+        stats.coverage_epoch_regions_visited,
+        stats.coverage_oldest_unvisited_ms,
+        stats.regions_deferred,
+        stats.coverage_random_source_available ? "true" : "false",
         stats.dispatch_slots_checked,
         stats.dispatch_targets_suspicious,
         stats.dispatch_targets_unavailable,

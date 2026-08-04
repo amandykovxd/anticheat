@@ -12,6 +12,7 @@ import unittest
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ from reference_receiver import (  # noqa: E402
     ReceiverHttpServer,
     ReceiverStore,
 )
+from correlation_rules import CorrelationError  # noqa: E402
 from telemetry_shipper import (  # noqa: E402
     ReceiverClient,
     RemoteRejectedError,
@@ -78,8 +80,9 @@ def session_request(
     seed: str,
     client_session_id: str = "a" * 32,
     schema_version: int = 4,
+    requested_session_id: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "protocol_version": PROTOCOL_VERSION,
         "client_session_id": client_session_id,
         "collector_id": "test-endpoint",
@@ -87,6 +90,9 @@ def session_request(
         "chain_algorithm": "sha256",
         "chain_seed": seed,
     }
+    if requested_session_id is not None:
+        request["requested_session_id"] = requested_session_id
+    return request
 
 
 def batch_request(
@@ -108,6 +114,7 @@ def make_attestation_records(
     file_digest: str,
     mapped_digest: str,
     response_override: str | None = None,
+    session_override: str | None = None,
 ) -> list[bytes]:
     first, chain = make_record(
         1,
@@ -116,10 +123,17 @@ def make_attestation_records(
         seed,
     )
     nonce_digest = hashlib.sha256(bytes.fromhex(challenge["nonce"])).hexdigest()
+    session_id = session_override or challenge["session_id"]
+    collector_version = "0.4.0"
+    collector_build_id = file_digest
     response = hashlib.sha256(
-        b"ac-collector-attestation-v1"
+        b"ac-collector-attestation-v2"
         + bytes.fromhex(challenge["challenge_id"])
         + bytes.fromhex(challenge["nonce"])
+        + bytes.fromhex(session_id)
+        + bytes([len(collector_version.encode("utf-8"))])
+        + collector_version.encode("utf-8")
+        + bytes.fromhex(collector_build_id)
         + bytes.fromhex(file_digest)
         + bytes.fromhex(mapped_digest)
     ).hexdigest()
@@ -133,6 +147,9 @@ def make_attestation_records(
             "expected_mapped_sha256": mapped_digest,
             "observed_mapped_sha256": mapped_digest,
             "response_sha256": response_override or response,
+            "server_session_id": session_id,
+            "collector_version": collector_version,
+            "collector_build_id": collector_build_id,
             "mapped_matches_disk": True,
             "complete": True,
         },
@@ -311,7 +328,11 @@ class CollectorAttestationTests(unittest.TestCase):
         self.assertEqual(status, HTTPStatus.CREATED)
         seed = "3" * 64
         status, session = self.store.create_session(
-            session_request(seed, schema_version=5)
+            session_request(
+                seed,
+                schema_version=5,
+                requested_session_id=challenge["session_id"],
+            )
         )
         self.assertEqual(status, HTTPStatus.CREATED)
         return challenge, session["session_id"], seed
@@ -323,6 +344,7 @@ class CollectorAttestationTests(unittest.TestCase):
         self.assertEqual(status, HTTPStatus.CREATED)
         self.assertEqual(len(challenge["challenge_id"]), 32)
         self.assertEqual(len(challenge["nonce"]), 64)
+        self.assertEqual(len(challenge["session_id"]), 32)
 
     def test_unregistered_collector_cannot_request_challenge(self) -> None:
         with self.assertRaises(ReceiverError) as captured:
@@ -381,22 +403,237 @@ class CollectorAttestationTests(unittest.TestCase):
             first_session, batch_request(first_seed, first_records)
         )
 
+        _, second_challenge = self.store.create_attestation_challenge(
+            {"collector_id": "test-endpoint"}
+        )
         second_seed = "4" * 64
         _, second = self.store.create_session(
             session_request(
                 second_seed,
                 client_session_id="b" * 32,
                 schema_version=5,
+                requested_session_id=second_challenge["session_id"],
             )
         )
         second_records = make_attestation_records(
-            second_seed, challenge, self.file_digest, self.mapped_digest
+            second_seed,
+            challenge,
+            self.file_digest,
+            self.mapped_digest,
+            session_override=second["session_id"],
         )
         with self.assertRaises(ReceiverError) as captured:
             self.store.append_batch(
                 second["session_id"], batch_request(second_seed, second_records)
             )
+        self.assertEqual(
+            captured.exception.code, "collector_attestation_wrong_session"
+        )
+
+    def test_consumed_challenge_cannot_be_submitted_again(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, self.mapped_digest
+        )
+        self.store.append_batch(session_id, batch_request(seed, records))
+        previous_chain = json.loads(records[-1])["chain"]
+        repeated, repeated_chain = make_record(
+            3,
+            "collector_attestation_observed",
+            json.loads(records[-1])["details"],
+            previous_chain,
+        )
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_batch(
+                session_id,
+                batch_request(
+                    previous_chain,
+                    [repeated],
+                    batch_sequence=2,
+                )
+                | {"chain_head": repeated_chain},
+            )
         self.assertEqual(captured.exception.code, "collector_attestation_replayed")
+
+    def test_expired_challenge_is_rejected(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, self.mapped_digest
+        )
+        with mock.patch(
+            "reference_receiver._now_ms",
+            return_value=int(challenge["expires_at_ms"]) + 1,
+        ):
+            with self.assertRaises(ReceiverError) as captured:
+                self.store.append_batch(session_id, batch_request(seed, records))
+        self.assertEqual(captured.exception.code, "collector_attestation_expired")
+
+    def test_challenge_survives_receiver_restart(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        restarted = ReceiverStore(
+            self.store.database,
+            trusted_collectors={
+                "test-endpoint": (self.file_digest, self.mapped_digest)
+            },
+            attestation_ttl_ms=60_000,
+        )
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, self.mapped_digest
+        )
+        status, _ = restarted.append_batch(
+            session_id, batch_request(seed, records)
+        )
+        self.assertEqual(status, HTTPStatus.ACCEPTED)
+        self.assertTrue(restarted.session_status(session_id)["attestation_verified"])
+
+    def test_modified_mapped_identity_is_rejected(self) -> None:
+        challenge, session_id, seed = self._challenge_and_session()
+        modified = "9" + self.mapped_digest[1:]
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, modified
+        )
+        with self.assertRaises(ReceiverError) as captured:
+            self.store.append_batch(session_id, batch_request(seed, records))
+        self.assertEqual(captured.exception.code, "collector_attestation_invalid")
+
+    def test_shipper_registers_the_challenge_reserved_session(self) -> None:
+        status, challenge = self.store.create_attestation_challenge(
+            {"collector_id": "test-endpoint"}
+        )
+        self.assertEqual(status, HTTPStatus.CREATED)
+        seed = "8" * 64
+        records = make_attestation_records(
+            seed, challenge, self.file_digest, self.mapped_digest
+        )
+        log = Path(self.temporary.name) / "attested-events.jsonl"
+        log.write_bytes(b"\n".join(records) + b"\n")
+        spool = TransportSpool(
+            Path(self.temporary.name) / "attested-spool.sqlite3",
+            log,
+            "test-endpoint",
+        )
+        result = spool.ingest_available()
+        self.assertEqual(result.records, 2)
+        shipper = TelemetryShipper(spool, DirectStoreClient(self.store))
+        registered, delivered, heartbeat = shipper.flush(heartbeat=True)
+        self.assertEqual((registered, delivered, heartbeat), (1, 1, True))
+        state = self.store.session_status(challenge["session_id"])
+        self.assertTrue(state["attestation_verified"])
+
+
+class CorrelationRulesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = ReceiverStore(Path(self.temporary.name) / "rules.sqlite3")
+
+    @staticmethod
+    def _rule(version: int = 1) -> dict[str, Any]:
+        return {
+            "rule_id": "kernel-memory-correlation",
+            "version": version,
+            "required_events": [
+                "kernel_thread_start_unlinked",
+                "executable_private_region",
+            ],
+            "window_events": 16,
+            "outcome": "suspicious_session",
+            "min_samples": 1,
+            "max_false_positive_rate": 0.25,
+        }
+
+    def _correlated_session(self, seed_byte: int = 0x71) -> str:
+        seed_hex = (bytes([seed_byte]) * 32).hex()
+        records: list[bytes] = []
+        chain = seed_hex
+        for sequence, event in enumerate(
+            (
+                "log_segment_opened",
+                "future_unknown_event",
+                "kernel_thread_start_unlinked",
+                "executable_private_region",
+            ),
+            start=1,
+        ):
+            details: dict[str, Any] = {"signal": event}
+            if sequence == 1:
+                details = {"schema": 5, "chain_seed": seed_hex}
+            record, chain = make_record(sequence, event, details, chain)
+            records.append(record)
+        _, session = self.store.create_session(
+            session_request(
+                seed_hex,
+                client_session_id=f"{seed_byte:02x}" * 16,
+                schema_version=5,
+            )
+        )
+        self.store.append_batch(
+            session["session_id"], batch_request(seed_hex, records)
+        )
+        return session["session_id"]
+
+    def test_new_rule_is_audit_only_and_references_inputs(self) -> None:
+        status = self.store.install_rule(self._rule())
+        self.assertEqual(status["mode"], "audit_only")
+        session_id = self._correlated_session()
+        decisions = self.store.correlation_decisions(session_id)
+        self.assertEqual(len(decisions), 1)
+        decision = decisions[0]
+        self.assertTrue(decision["audit_only"])
+        self.assertEqual(decision["rule_version"], 1)
+        self.assertEqual(
+            decision["input_event_ids"],
+            sorted([f"{session_id}:3", f"{session_id}:4"]),
+        )
+        with self.store._connect() as connection:
+            unknown = connection.execute(
+                """
+                SELECT raw_json FROM correlation_events
+                 WHERE session_id = ? AND event_name = 'future_unknown_event'
+                """,
+                (session_id,),
+            ).fetchone()
+        self.assertIsNotNone(unknown)
+        assert unknown is not None
+        self.assertEqual(json.loads(bytes(unknown["raw_json"]))["seq"], 2)
+
+    def test_promotion_requires_false_positive_threshold(self) -> None:
+        self.store.install_rule(self._rule())
+        session_id = self._correlated_session()
+        decision = self.store.correlation_decisions(session_id)[0]
+        self.store.record_decision_feedback(decision["decision_id"], True)
+        with self.assertRaises(CorrelationError):
+            self.store.promote_rule("kernel-memory-correlation")
+        self.store.record_decision_feedback(decision["decision_id"], False)
+        promoted = self.store.promote_rule("kernel-memory-correlation")
+        self.assertEqual(promoted["mode"], "active")
+        self.assertEqual(promoted["false_positive_rate"], 0.0)
+
+    def test_rule_versions_are_immutable_and_rollback_is_audited(self) -> None:
+        self.store.install_rule(self._rule(1))
+        with self.assertRaises(CorrelationError):
+            self.store.install_rule(self._rule(1))
+        second = self.store.install_rule(self._rule(2))
+        self.assertEqual(second["version"], 2)
+        rolled_back = self.store.rollback_rule(
+            "kernel-memory-correlation", 1
+        )
+        self.assertEqual(rolled_back["version"], 1)
+        with self.store._connect() as connection:
+            actions = [
+                row["action"]
+                for row in connection.execute(
+                    """
+                    SELECT action FROM correlation_rule_audit
+                     WHERE rule_id = ? ORDER BY audit_id
+                    """,
+                    ("kernel-memory-correlation",),
+                ).fetchall()
+            ]
+        self.assertEqual(
+            actions,
+            ["installed_audit_only", "installed_audit_only", "rolled_back"],
+        )
 
 
 class SpoolTests(unittest.TestCase):

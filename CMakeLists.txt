@@ -16,6 +16,7 @@ add_library(anticheat_portable STATIC
     src/dedup.c
     src/pe.c
     src/ranges.c
+    src/schedule.c
     src/sha256.c
     src/text.c
 )
@@ -37,6 +38,10 @@ if(BUILD_TESTING)
         range_index
         range_index_merges_overlaps
         range_index_many_entries
+        schedule_delay_bounds
+        schedule_permutation
+        schedule_singleton
+        schedule_fair_windows
         dedup_suppresses_repeats
         dedup_zero_interval
         dedup_saturation
@@ -82,6 +87,7 @@ endif()
 install(
     PROGRAMS
         tools/reference_receiver.py
+        tools/correlation_rules.py
         tools/request_attestation_challenge.py
         tools/telemetry_shipper.py
         tools/transport_common.py
@@ -89,7 +95,9 @@ install(
     DESTINATION tools
 )
 install(
-    FILES docs/transport-integration.md
+    FILES
+        docs/transport-integration.md
+        docs/correlation-integration.md
     DESTINATION docs
 )
 

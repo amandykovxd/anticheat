@@ -65,6 +65,9 @@ typedef struct AcLogger {
 
 typedef struct AcCollectorAttestation {
     char challenge_id[AC_ATTESTATION_CHALLENGE_HEX_SIZE];
+    char server_session_id[33];
+    char collector_version[64];
+    char collector_build_id[AC_SHA256_HEX_SIZE];
     char nonce_sha256[AC_SHA256_HEX_SIZE];
     char file_sha256[AC_SHA256_HEX_SIZE];
     char expected_mapped_sha256[AC_SHA256_HEX_SIZE];
@@ -192,8 +195,13 @@ typedef struct AcScanStats {
     size_t dispatch_targets_unavailable;
     size_t region_events_omitted;
     uint64_t integrity_bytes;
+    uint64_t coverage_epoch;
+    uint64_t coverage_epoch_regions_visited;
+    uint64_t coverage_oldest_unvisited_ms;
+    size_t regions_deferred;
     bool region_scan_truncated;
     bool coverage_complete;
+    bool coverage_random_source_available;
 } AcScanStats;
 
 typedef struct AcContext {
@@ -204,6 +212,16 @@ typedef struct AcContext {
     AcDedup dedup;
     AcIntegrityCache integrity;
     size_t integrity_cursor;
+    uintptr_t region_cursor;
+    uintptr_t region_epoch_anchor;
+    uint64_t coverage_epoch;
+    uint64_t coverage_epoch_started_ms;
+    uint64_t coverage_epoch_regions_visited;
+    uint64_t region_finding_cursor;
+    bool region_epoch_wrapped;
+    bool region_cursor_initialized;
+    bool coverage_random_source_available;
+    bool coverage_random_failure_reported;
     uint8_t probe_buffer[AC_PROBE_BYTES];
     uint8_t integrity_block[AC_INTEGRITY_BLOCK_SIZE];
     uint8_t integrity_expected[AC_INTEGRITY_BLOCK_SIZE];
@@ -298,6 +316,7 @@ typedef struct AcKernelClient {
     bool queue_saturated;
     bool telemetry_complete;
     bool session_registered;
+    bool correlation_random_source_available;
     AcKernelImageObservation image_observations[
         AC_KERNEL_MAX_IMAGE_OBSERVATIONS];
     AcKernelThreadObservation thread_observations[
@@ -332,6 +351,7 @@ void ac_log_win32_error_severity(
 bool ac_collector_attest(
     const wchar_t *challenge_id,
     const wchar_t *nonce,
+    const wchar_t *server_session_id,
     AcCollectorAttestation *result);
 void ac_log_collector_attestation(
     AcLogger *logger,

@@ -13,6 +13,7 @@ macOS and Linux collectors, composed of:
 - `anticheat.exe`: user-mode collector and process-memory scanner;
 - `tools/telemetry_shipper.py`: bounded asynchronous delivery sidecar;
 - `tools/reference_receiver.py`: authenticated remote anchor receiver;
+- `tools/correlation_rules.py`: versioned audit-only server correlation;
 - `tools/verify_log.py`: JSONL integrity-chain verifier;
 - a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
@@ -423,7 +424,8 @@ that would allow an endpoint attacker to replace both values.
 4. Request a receiver challenge and start the collector with `--pid`,
    `--require-kernel`, `--require-secure-kernel`, `--require-manifest`,
    `--manifest`, `--manifest-sha256`, `--attestation-challenge`,
-   `--attestation-nonce`, and `--require-attestation`.
+   `--attestation-nonce`, `--attestation-session`, and
+   `--require-attestation`.
 5. Start `tools/telemetry_shipper.py` against the JSONL path and an
    authenticated HTTPS receiver.
 6. Confirm server session registration, batch acknowledgements, and heartbeat
@@ -455,7 +457,9 @@ state at the next scan.
 | `--process <name>` | Resolve a target by executable name. |
 | `--pid <id>` | Select an explicit target PID. Preferred for integration. |
 | `--wait-timeout-ms <n>` | Stop waiting for a named process after `n` milliseconds. |
-| `--interval-ms <n>` | Base user-mode scan interval, `1000..3600000`; each wait is jittered by up to 20 percent. |
+| `--interval-ms <n>` | Compatibility option that sets randomized bounds to approximately ±20 percent of `n`. |
+| `--interval-min-ms <n>` | Minimum randomized scan delay, `1000..3600000`. |
+| `--interval-max-ms <n>` | Maximum randomized scan delay, `1000..3600000`. |
 | `--once` | Run one user-mode scan and exit. |
 | `--allow-root <dir>` | Add an expected module root. Repeatable. |
 | `--kernel` | Consume driver events when the driver is available. |
@@ -472,6 +476,7 @@ state at the next scan.
 | `--require-manifest` | Exit when the pinned manifest is absent or invalid. |
 | `--attestation-challenge <hex>` | Set the 16-byte server challenge identifier. |
 | `--attestation-nonce <hex>` | Set the 32-byte server nonce. |
+| `--attestation-session <hex>` | Bind the response to the challenge-reserved 16-byte server session. |
 | `--require-attestation` | Fail if the nonce-bound collector self-measurement is absent or inconsistent. |
 | `--print-attestation-digest` | Print release file and normalized mapped-image digests, then exit. |
 | `--log <path>` | Set the JSONL output path. |

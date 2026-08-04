@@ -23,6 +23,7 @@ enforcement.
 - [Contribution workflow](wiki/Contribution-Workflow.html)
 - [Driver ABI and lifecycle](driver-integration.html)
 - [Authenticated transport and remote anchoring](transport-integration.html)
+- [Audit-only correlation service](correlation-integration.html)
 - [Event schema](event-schema.html)
 - [Adversarial analysis](adversarial-analysis.html)
 - [DragonBurn defensive analysis](dragonburn-threat-analysis.html)

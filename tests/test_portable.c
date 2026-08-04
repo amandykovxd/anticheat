@@ -1,6 +1,7 @@
 #include "dedup.h"
 #include "pe.h"
 #include "ranges.h"
+#include "schedule.h"
 #include "sha256.h"
 #include "text.h"
 
@@ -656,6 +657,62 @@ static void test_pe_relocation_block_loop_is_bounded(void)
     ac_pe_mask_free(&mask);
 }
 
+static void test_schedule_delay_bounds(void)
+{
+    AC_CHECK(ac_schedule_delay_from_random(4000u, 6000u, 0u) == 4000u);
+    AC_CHECK(ac_schedule_delay_from_random(4000u, 6000u, 2000u) == 6000u);
+    AC_CHECK(ac_schedule_delay_from_random(4000u, 6000u, 2001u) == 4000u);
+    AC_CHECK(ac_schedule_delay_from_random(5000u, 4000u, 42u) == 5000u);
+}
+
+static void test_schedule_permutation(void)
+{
+    bool observed[65];
+    size_t position;
+    const size_t step = ac_schedule_coprime_step(65u, 10u);
+
+    memset(observed, 0, sizeof(observed));
+    AC_CHECK(step > 0u && step < 65u);
+    for (position = 0; position < 65u; ++position) {
+        const size_t index = ac_schedule_permutation_index(
+            position, 65u, 37u, step);
+        AC_CHECK(index < 65u);
+        AC_CHECK(!observed[index]);
+        observed[index] = true;
+    }
+    for (position = 0; position < 65u; ++position) {
+        AC_CHECK(observed[position]);
+    }
+}
+
+static void test_schedule_singleton(void)
+{
+    AC_CHECK(ac_schedule_coprime_step(0u, 99u) == 1u);
+    AC_CHECK(ac_schedule_coprime_step(1u, 99u) == 1u);
+    AC_CHECK(ac_schedule_permutation_index(100u, 1u, 88u, 1u) == 0u);
+    AC_CHECK(ac_schedule_permutation_index(100u, 0u, 88u, 1u) == 0u);
+}
+
+static void test_schedule_fair_windows(void)
+{
+    bool visited[129];
+    size_t cursor = 73u;
+    size_t epoch;
+
+    memset(visited, 0, sizeof(visited));
+    for (epoch = 0; epoch < 3u; ++epoch) {
+        size_t position;
+        for (position = 0; position < 64u; ++position) {
+            visited[ac_schedule_cyclic_index(position, 129u, cursor)] = true;
+        }
+        cursor = ac_schedule_cyclic_index(64u, 129u, cursor);
+    }
+    for (epoch = 0; epoch < 129u; ++epoch) {
+        AC_CHECK(visited[epoch]);
+    }
+    AC_CHECK(visited[128]); /* A high-address payload after 128 decoys is visited. */
+}
+
 typedef void (*AcPortableTestFunction)(void);
 
 typedef struct AcPortableTestCase {
@@ -671,6 +728,10 @@ static const AcPortableTestCase g_test_cases[] = {
     {"range_index", test_range_index},
     {"range_index_merges_overlaps", test_range_index_merges_overlaps},
     {"range_index_many_entries", test_range_index_many_entries},
+    {"schedule_delay_bounds", test_schedule_delay_bounds},
+    {"schedule_permutation", test_schedule_permutation},
+    {"schedule_singleton", test_schedule_singleton},
+    {"schedule_fair_windows", test_schedule_fair_windows},
     {"dedup_suppresses_repeats", test_dedup_suppresses_repeats},
     {"dedup_zero_interval", test_dedup_never_repeats_with_zero_interval},
     {"dedup_saturation", test_dedup_fails_open_when_saturated},

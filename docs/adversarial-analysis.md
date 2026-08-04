@@ -116,18 +116,20 @@ scan and every 250 milliseconds while waiting, and exposes cumulative loss in
 `agent_stopped`. A remote policy must reject a session whose
 `kernel_telemetry_complete` is false; no finite local queue closes flooding.
 
-### B3. Flood user-mode findings — *partial*
+### B3. Flood user-mode findings — *mitigated with explicit residual risk*
 
 `ac_scan_memory_regions` reports at most `AC_MAX_REGION_EVENTS_PER_SCAN` (64)
-regions. It now uses reservoir sampling, so low-address allocations cannot
-deterministically exclude a high-address payload. The omitted count is emitted
-as `scan_coverage_gap`. Flooding still reduces the probability that any one
-region is sampled. The same applies to the 4 MiB probe budget and the 16 MiB
-integrity budget.
+regions. A CSPRNG-selected address-space epoch cursor continues across bounded
+scans, while a persistent cyclic finding window advances by the event capacity.
+Stable low-address decoys therefore cannot permanently exclude a stable
+high-address payload. Epoch age, visits, deferrals, and omitted findings are
+emitted as coverage metrics. Rapidly created and removed regions can still fall
+between observations. The same temporal limitation applies to probe and
+integrity budgets.
 
 Countermeasure: the caps are necessary, but hitting them must be reported as a
-finding rather than applied silently, and the scan order must be randomised so
-an attacker cannot rely on address ordering to hide.
+finding rather than applied silently. A server should invalidate sessions with
+sustained deferrals, omitted findings, or random-source failure.
 
 ### B4. Saturate the de-duplication table — *partial*
 

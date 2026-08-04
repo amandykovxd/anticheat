@@ -49,7 +49,7 @@ python tools/reference_receiver.py \
   --key /etc/anticheat/tls/server-key.pem \
   --client-ca /etc/anticheat/tls/client-ca.pem \
   --heartbeat-ms 15000 \
-  --trusted-collector launcher-node-017:<collector-file-sha256>:<mapped-image-sha256>
+  --trusted-collector launcher-node-017:<collector-file-sha256>:<mapped-image-sha256>:0.4.0:<collector-build-sha256>
 ```
 
 Obtain the two trusted digests from the exact signed release binary on a clean
@@ -65,11 +65,13 @@ python tools/request_attestation_challenge.py \
   --ca-file /etc/anticheat/receiver-ca.pem
 ```
 
-Pass the returned `challenge_id` and `nonce` to
-`--attestation-challenge`, `--attestation-nonce`, and
+Pass the returned `challenge_id`, `nonce`, and reserved `session_id` to
+`--attestation-challenge`, `--attestation-nonce`, `--attestation-session`, and
 `--require-attestation`. The nonce is not written to the event stream; the
 collector logs its digest and a domain-separated response over the challenge,
-nonce, file digest, and normalized mapped-image digest.
+nonce, reserved server session, semantic version, immutable build digest, file
+digest, and normalized mapped-image digest. The shipper extracts the reserved
+session from the chained attestation event and uses it during registration.
 
 The unauthenticated `GET /healthz` endpoint reports process availability. All
 session endpoints require the bearer credential. Place the service behind
