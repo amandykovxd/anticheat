@@ -677,6 +677,9 @@ static void test_schedule_permutation(void)
         const size_t index = ac_schedule_permutation_index(
             position, 65u, 37u, step);
         AC_CHECK(index < 65u);
+        if (index >= 65u) {
+            return;
+        }
         AC_CHECK(!observed[index]);
         observed[index] = true;
     }
