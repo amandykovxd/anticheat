@@ -133,14 +133,16 @@ are additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Automated test inventory
 
-Windows builds register 52 independent CTest cases: 17 portable algorithms,
-31 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
-macOS builds register 23 cases: 17 portable cases, 3 CLI contracts, one live
+Windows builds register 60 independent CTest cases: 21 portable algorithms,
+35 Windows collector/core behaviors, 3 CLI contracts, and the transport suite.
+macOS builds register 27 cases: 21 portable cases, 3 CLI contracts, one live
 self-scan, one suspicious-region integration test, and the transport suite.
-Linux sanitizer builds register 22 cases: 17 portable cases, 3 Linux collector
-contracts, one suspicious-mapping integration test, and the transport suite.
+Linux builds register 27 cases: 21 portable cases, 3 Linux collector
+contracts, one suspicious-mapping test, one process-audit test, and the
+transport suite.
 The transport CTest entry contains
-22 protocol, persistence, tamper, authentication, rotation, and backpressure
+36 protocol, attestation, correlation, persistence, tamper, authentication,
+rotation, and backpressure
 tests.
 
 List the registered cases without executing them:
