@@ -644,13 +644,18 @@ driver/
   Directory.Build.props   imports the restored WDK and SDK packages
   src/driver.c            callbacks, device, IOCTLs, bounded queue
 src/
+  main.c                  Windows collector entry point and CLI
+  macos_main.c            macOS libproc collector entry point
+  linux_main.c            Linux procfs, ptrace, mapping, and uinput sensor
+  watchdog_service.c      anticheat_watchdog_service.exe SCM host
   kernel_client.c         user-mode driver client
   process.c               target discovery and identity validation
   scanner.c               module and memory telemetry
   threat_sensor.c         posture, kernel-device, process, and overlay signals
   manifest.c              pinned module and driver authorization manifest
   manifest.h              manifest parser and match contract
-  linux_main.c            Linux procfs, ptrace, mapping, and uinput sensor
+  attestation.c           nonce-bound collector self-measurement
+  schedule.c              randomized scan-interval scheduling
   integrity.c             PE section, import and export validation
   log.c                   JSONL output, rotation, integrity chain
   dedup.c                 bounded finding de-duplication
@@ -659,15 +664,32 @@ src/
   sha256.c                SHA-256 implementation
   text.c                  JSON escaping and fingerprints
 tests/
-  test_core.c             Windows integration and ABI tests
-  test_portable.c         portable unit tests
-  test_transport.py       remote anchoring and spool tests
+  test_core.c                     Windows integration and ABI tests
+  test_portable.c                 portable unit tests
+  test_transport.py               remote anchoring and spool tests
+  test_watchdog.py                watchdog identity, restart, and terminal-state tests
+  test_linux_suspicious_fixture.py Linux suspicious-mapping integration test
+  test_linux_audit_fixture.py     Linux process_vm_readv/writev audit test
+  test_macos_suspicious_fixture.py macOS anonymous executable-region test
 tools/
-  telemetry_shipper.py    bounded asynchronous delivery sidecar
-  session_watchdog.py     process identity and liveness supervisor
-  reference_receiver.py   authenticated anchor receiver
-  transport_common.py     shared protocol and chain validation
-  verify_log.py           log-chain verifier
+  telemetry_shipper.py            bounded asynchronous delivery sidecar
+  session_watchdog.py             process identity and liveness supervisor
+  reference_receiver.py           authenticated anchor receiver
+  correlation_rules.py            versioned audit-only server correlation
+  transport_common.py             shared protocol and chain validation
+  request_attestation_challenge.py one-time attestation challenge request
+  verify_log.py                   log-chain verifier
+  install_linux_audit_rules.sh    Linux Audit rule installer
+  macos_suspicious_fixture.py     macOS anonymous R-X region fixture
+  linux_suspicious_fixture.py     Linux suspicious-mapping fixture
+  windows/
+    Install-WatchdogService.ps1     register the watchdog SCM service
+    Update-WatchdogService.ps1      update an installed watchdog service
+    Uninstall-WatchdogService.ps1   remove the watchdog service
+    Invoke-DriverVerifier.ps1       Driver Verifier enable/query/reset phases
+    Invoke-HlkQualification.ps1     HLK PDEF execution and evidence upload
+    New-DriverSubmission.ps1        sign and package the Partner Center CAB
+    Test-MicrosoftSignedDriver.ps1  validate a Microsoft-signed return package
 ```
 
 ## Additional documentation
@@ -675,6 +697,7 @@ tools/
 - [Driver integration](docs/driver-integration.md)
 - [Transport integration](docs/transport-integration.md)
 - [Watchdog service integration](docs/watchdog-integration.md)
+- [Correlation service integration](docs/correlation-integration.md)
 - [Event schema](docs/event-schema.md)
 - [Adversarial analysis](docs/adversarial-analysis.md)
 - [DragonBurn defensive analysis](docs/dragonburn-threat-analysis.md)
