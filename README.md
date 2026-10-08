@@ -139,14 +139,15 @@ are additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Automated test inventory
 
-Windows builds register 61 independent CTest cases: 21 portable algorithms,
-35 Windows collector/core behaviors, 3 CLI contracts, the transport suite, and
-the watchdog suite.
-macOS builds register 28 cases: 21 portable cases, 3 CLI contracts, one live
-self-scan, one suspicious-region integration test, and the transport suite.
-Linux builds register 28 cases: 21 portable cases, 3 Linux collector
+Windows builds register 72 independent CTest cases: 29 portable algorithms,
+37 Windows collector/core behaviors, 3 CLI contracts, and the transport,
+manifest-signing, and watchdog suites.
+macOS builds register 37 cases: 29 portable cases, 3 CLI contracts, one live
+self-scan, one suspicious-region integration test, and the transport,
+manifest-signing, and watchdog suites.
+Linux builds register 37 cases: 29 portable cases, 3 Linux collector
 contracts, one suspicious-mapping test, one process-audit test, and the
-transport and watchdog suites.
+transport, manifest-signing, and watchdog suites.
 The transport CTest entry contains
 40 protocol, attestation, correlation, persistence, tamper, authentication,
 rotation, and backpressure
@@ -167,9 +168,9 @@ ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 ```
 
 The available labels include `portable`, `core`, `cli`, `windows`, `macos`,
-`linux`, `transport`, `operations`, and `integration`. The Windows CI matrix
-rejects a configuration that does not expose exactly 61 independent CTest
-entries.
+`linux`, `transport`, `manifest`, `operations`, and `integration`. The Windows
+CI matrix rejects a configuration that does not expose exactly 72 independent
+CTest entries.
 
 ## Build and run on macOS
 
@@ -416,25 +417,59 @@ privileges when the target process ACL permits read access.
 ## Integration sequence
 
 Generate a deployment manifest containing exact module and driver file names
-and SHA-256 values. The manifest format is intentionally line-oriented:
+and SHA-256 values. Production deployments sign it offline as
+`ac-manifest-v2`:
+
+```bash
+python3 tools/manifest_tool.py keygen \
+  --private-key release-2026.key --public-key release-2026.pub
+python3 tools/manifest_tool.py sign \
+  --private-key release-2026.key \
+  --entries entries.txt \
+  --application game \
+  --build-id <64-hex-build-id> \
+  --sequence 42 \
+  --not-after <unix-seconds> \
+  --output manifest.txt
+```
+
+`entries.txt` uses the line-oriented entry syntax; the signed document adds
+an identity header and an Ed25519 trailer:
 
 ```text
-ac-manifest-v1
+ac-manifest-v2
+application game
+build-id <64-hex-build-id>
+sequence 42
+not-before 1791417600
+not-after 1794096000
 module <64-hex-sha256> game.exe
 module <64-hex-sha256> client.dll
 driver <64-hex-sha256> AcTelemetry.sys
+signature ed25519 <16-hex-key-id> <128-hex-signature>
 ```
 
-Deliver the manifest hash over the authenticated launcher/control-plane
-channel. Do not read the expected hash from a file stored beside the manifest;
-that would allow an endpoint attacker to replace both values.
+The collector verifies the signature before interpreting the body, then
+enforces the validity window and the `--manifest-min-sequence` rollback floor.
+Rotate keys by supplying the outgoing and incoming public keys with repeated
+`--manifest-public-key` options until every published manifest is signed by
+the new key. Keep signing keys on an offline release host; distribute only
+public keys and the current minimum sequence through the authenticated
+launcher/control-plane channel. `--manifest-sha256` may additionally pin the
+exact signed file.
+
+The unsigned `ac-manifest-v1` format remains accepted only with
+`--manifest-sha256` and without public keys. Do not read the expected hash
+from a file stored beside the manifest; that would allow an endpoint attacker
+to replace both values.
 
 1. Build, qualify, submit, and verify the Microsoft-signed driver package.
 2. Install and start the `AcTelemetry` driver service during product setup.
 3. Start the protected application and retain its PID and process handle.
 4. Request a receiver challenge and start the collector with `--pid`,
    `--require-kernel`, `--require-secure-kernel`, `--require-manifest`,
-   `--manifest`, `--manifest-sha256`, `--attestation-challenge`,
+   `--manifest`, `--manifest-public-key`, `--manifest-min-sequence`,
+   `--attestation-challenge`,
    `--attestation-nonce`, `--attestation-session`, and
    `--require-attestation`.
 5. Start `tools/telemetry_shipper.py` against the JSONL path and an
@@ -483,8 +518,10 @@ state at the next scan.
 | `--watch-pointer <module+rva>` | Validate a game-specific function-pointer slot against loader-visible module ranges. Repeatable. |
 | `--watch-vtable <module+rva:entries>` | Resolve an object pointer stored at the module RVA and validate its VMT storage and entries. Repeatable. |
 | `--manifest <path>` | Load the module and driver authorization manifest. |
-| `--manifest-sha256 <hex>` | Pin the manifest to a SHA-256 value supplied by the control plane. |
-| `--require-manifest` | Exit when the pinned manifest is absent or invalid. |
+| `--manifest-sha256 <hex>` | Pin the manifest to a SHA-256 value supplied by the control plane. Required for `ac-manifest-v1`; optional with public keys. |
+| `--manifest-public-key <hex>` | Trust an Ed25519 public key for `ac-manifest-v2`. Repeatable up to 8 keys for rotation. |
+| `--manifest-min-sequence <n>` | Reject a signed manifest whose sequence is below `n`. Requires a public key. |
+| `--require-manifest` | Exit when the trusted manifest is absent or invalid. |
 | `--attestation-challenge <hex>` | Set the 16-byte server challenge identifier. |
 | `--attestation-nonce <hex>` | Set the 32-byte server nonce. |
 | `--attestation-session <hex>` | Bind the response to the challenge-reserved 16-byte server session. |
@@ -652,8 +689,10 @@ src/
   process.c               target discovery and identity validation
   scanner.c               module and memory telemetry
   threat_sensor.c         posture, kernel-device, process, and overlay signals
-  manifest.c              pinned module and driver authorization manifest
+  manifest.c              pinned or signed module and driver authorization manifest
   manifest.h              manifest parser and match contract
+  manifest_envelope.c     portable ac-manifest-v2 signature, validity, and rollback checks
+  ed25519.c               SHA-512 and Ed25519 signature verification
   attestation.c           nonce-bound collector self-measurement
   schedule.c              randomized scan-interval scheduling
   integrity.c             PE section, import and export validation
@@ -667,6 +706,7 @@ tests/
   test_core.c                     Windows integration and ABI tests
   test_portable.c                 portable unit tests
   test_transport.py               remote anchoring and spool tests
+  test_manifest_tool.py           manifest signing format and CLI tests
   test_watchdog.py                watchdog identity, restart, and terminal-state tests
   test_linux_suspicious_fixture.py Linux suspicious-mapping integration test
   test_linux_audit_fixture.py     Linux process_vm_readv/writev audit test
@@ -678,6 +718,7 @@ tools/
   correlation_rules.py            versioned audit-only server correlation
   transport_common.py             shared protocol and chain validation
   request_attestation_challenge.py one-time attestation challenge request
+  manifest_tool.py                offline manifest key, sign, and verify tool
   verify_log.py                   log-chain verifier
   install_linux_audit_rules.sh    Linux Audit rule installer
   macos_suspicious_fixture.py     macOS anonymous R-X region fixture

@@ -122,7 +122,8 @@ class TransportSpool:
                     device INTEGER NOT NULL,
                     inode INTEGER NOT NULL,
                     byte_offset INTEGER NOT NULL,
-                    active_local_session_id TEXT
+                    active_local_session_id TEXT,
+                    file_identity TEXT
                 );
                 CREATE TABLE IF NOT EXISTS local_sessions (
                     local_session_id TEXT PRIMARY KEY,
@@ -169,20 +170,38 @@ class TransportSpool:
                     "ALTER TABLE local_sessions "
                     "ADD COLUMN requested_server_session_id TEXT"
                 )
+            # Windows reports 128-bit ReFS file IDs through st_ino, which do
+            # not fit SQLite INTEGER. The identity is kept as exact text; the
+            # legacy integer columns are retained only for schema compatibility.
+            cursor_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(source_cursor)"
+                ).fetchall()
+            }
+            if "file_identity" not in cursor_columns:
+                connection.execute(
+                    "ALTER TABLE source_cursor ADD COLUMN file_identity TEXT"
+                )
+                connection.execute(
+                    "UPDATE source_cursor "
+                    "SET file_identity = CAST(device AS TEXT) || ':' || "
+                    "CAST(inode AS TEXT) WHERE file_identity IS NULL"
+                )
 
     @staticmethod
-    def _identity(path: Path) -> tuple[int, int, int]:
+    def _identity(path: Path) -> tuple[str, int]:
         status = path.stat()
-        return int(status.st_dev), int(status.st_ino), int(status.st_size)
+        return f"{int(status.st_dev)}:{int(status.st_ino)}", int(status.st_size)
 
-    def _matching_rotated_path(self, device: int, inode: int) -> Path | None:
+    def _matching_rotated_path(self, identity: str) -> Path | None:
         for generation in range(1, MAX_ROTATION_GENERATIONS + 1):
             candidate = Path(f"{self.source}.{generation}")
             try:
-                candidate_device, candidate_inode, _ = self._identity(candidate)
+                candidate_identity, _ = self._identity(candidate)
             except FileNotFoundError:
                 continue
-            if candidate_device == device and candidate_inode == inode:
+            if candidate_identity == identity:
                 return candidate
         return None
 
@@ -225,14 +244,14 @@ class TransportSpool:
                 raise SourceGapError("spool database belongs to a different source path")
             return cursor
 
-        device, inode, _ = self._identity(self.source)
+        identity, _ = self._identity(self.source)
         connection.execute(
             """
             INSERT INTO source_cursor (
-                singleton, source_path, device, inode, byte_offset
-            ) VALUES (1, ?, ?, ?, 0)
+                singleton, source_path, device, inode, byte_offset, file_identity
+            ) VALUES (1, ?, 0, 0, 0, ?)
             """,
-            (str(self.source), device, inode),
+            (str(self.source), identity),
         )
         cursor = connection.execute(
             "SELECT * FROM source_cursor WHERE singleton = 1"
@@ -243,16 +262,11 @@ class TransportSpool:
     def _resolve_cursor_path(
         self, connection: sqlite3.Connection, cursor: sqlite3.Row
     ) -> tuple[Path, bool]:
-        current_device, current_inode, _ = self._identity(self.source)
-        if (
-            int(cursor["device"]) == current_device
-            and int(cursor["inode"]) == current_inode
-        ):
+        current_identity, _ = self._identity(self.source)
+        if cursor["file_identity"] == current_identity:
             return self.source, True
 
-        rotated = self._matching_rotated_path(
-            int(cursor["device"]), int(cursor["inode"])
-        )
+        rotated = self._matching_rotated_path(cursor["file_identity"])
         if rotated is None:
             raise SourceGapError(
                 "the source rotated beyond retained generations before it was spooled"
@@ -317,20 +331,20 @@ class TransportSpool:
                 cursor = self._initialize_cursor(connection)
                 cursor_path, is_current = self._resolve_cursor_path(connection, cursor)
                 offset = int(cursor["byte_offset"])
-                _, _, source_size = self._identity(cursor_path)
+                _, source_size = self._identity(cursor_path)
                 if offset > source_size:
                     raise SourceGapError("source was truncated before it was spooled")
 
                 if offset == source_size:
                     if not is_current:
-                        device, inode, _ = self._identity(self.source)
+                        identity, _ = self._identity(self.source)
                         connection.execute(
                             """
                             UPDATE source_cursor
-                               SET device = ?, inode = ?, byte_offset = 0
+                               SET file_identity = ?, byte_offset = 0
                              WHERE singleton = 1
                             """,
-                            (device, inode),
+                            (identity,),
                         )
                         connection.commit()
                         continue

@@ -14,6 +14,8 @@ endfunction()
 # It has no Windows dependency so the logic can be built and tested anywhere.
 add_library(anticheat_portable STATIC
     src/dedup.c
+    src/ed25519.c
+    src/manifest_envelope.c
     src/pe.c
     src/ranges.c
     src/schedule.c
@@ -52,6 +54,14 @@ if(BUILD_TESTING)
         pe_malformed_bounds
         pe_rejects_non_pe
         pe_relocation_bounds
+        sha512_vectors
+        ed25519_rfc8032
+        ed25519_malleability
+        manifest_envelope_valid
+        manifest_envelope_rotation
+        manifest_envelope_tamper
+        manifest_envelope_validity
+        manifest_envelope_malformed
     )
     foreach(test_case IN LISTS AC_PORTABLE_TEST_CASES)
         add_test(
@@ -82,6 +92,21 @@ if(BUILD_TESTING)
                     "PYTHONDONTWRITEBYTECODE=1;PYTHONWARNINGS=error::ResourceWarning"
         )
         add_test(
+            NAME manifest.signing
+            COMMAND
+                ${Python3_EXECUTABLE}
+                -m unittest -v tests/test_manifest_tool.py
+        )
+        set_tests_properties(
+            manifest.signing
+            PROPERTIES
+                LABELS "manifest;operations"
+                TIMEOUT 120
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1;PYTHONWARNINGS=error::ResourceWarning"
+        )
+        add_test(
             NAME operations.watchdog
             COMMAND
                 ${Python3_EXECUTABLE}
@@ -103,6 +128,7 @@ install(
     PROGRAMS
         tools/reference_receiver.py
         tools/correlation_rules.py
+        tools/manifest_tool.py
         tools/request_attestation_challenge.py
         tools/telemetry_shipper.py
         tools/session_watchdog.py
@@ -317,6 +343,8 @@ if(BUILD_TESTING)
         manifest_pinned_load
         manifest_wrong_pin
         manifest_duplicate
+        manifest_signed_load
+        manifest_signed_rejections
         manifest_integrity_violation
         threat_process_indicators
         threat_device_indicators

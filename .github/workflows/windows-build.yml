@@ -135,8 +135,8 @@ jobs:
               Out-String |
               ConvertFrom-Json
           )
-          if ($inventory.tests.Count -ne 61) {
-            throw "Expected 61 independent tests, found $($inventory.tests.Count)"
+          if ($inventory.tests.Count -ne 72) {
+            throw "Expected 72 independent tests, found $($inventory.tests.Count)"
           }
 
       - name: Test
@@ -221,7 +221,7 @@ jobs:
       - name: Verify automated test inventory
         run: |
           count=$(ctest --preset macos-release -N | sed -n 's/^Total Tests: //p')
-          test "$count" = 28
+          test "$count" = 37
 
       - name: Install
         run: cmake --install out/build/macos --prefix out/install/macos
@@ -267,7 +267,7 @@ jobs:
       - name: Verify automated test inventory
         run: |
           count=$(ctest --test-dir out/build/linux -N | sed -n 's/^Total Tests: //p')
-          test "$count" = 28
+          test "$count" = 37
 
       - name: Test
         run: ctest --test-dir out/build/linux --output-on-failure

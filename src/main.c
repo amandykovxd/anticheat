@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <wchar.h>
 
 #include "schedule.h"
@@ -40,6 +41,10 @@ typedef struct AcOptions {
     bool require_kernel;
     const wchar_t *manifest_path;
     const wchar_t *manifest_sha256;
+    uint8_t manifest_public_keys[AC_MANIFEST_ENVELOPE_MAX_KEYS][AC_ED25519_PUBLIC_KEY_SIZE];
+    size_t manifest_public_key_count;
+    uint64_t manifest_min_sequence;
+    bool manifest_min_sequence_set;
     bool require_manifest;
     const wchar_t *attestation_challenge;
     const wchar_t *attestation_nonce;
@@ -138,7 +143,9 @@ static void ac_print_usage(const wchar_t *program)
         L"  --integrity-max-file <n>  largest module file to validate (default 67108864)\n"
         L"  --manifest <file>         trusted module/driver manifest\n"
         L"  --manifest-sha256 <hex>   control-plane pin for the manifest file\n"
-        L"  --require-manifest        fail when the pinned manifest is unavailable\n"
+        L"  --manifest-public-key <hex>  Ed25519 key for ac-manifest-v2 (repeatable)\n"
+        L"  --manifest-min-sequence <n>  reject signed manifests below this sequence\n"
+        L"  --require-manifest        fail when the trusted manifest is unavailable\n"
         L"  --attestation-challenge <id>  server challenge id (32 hex)\n"
         L"  --attestation-nonce <hex>     server nonce (64 hex)\n"
         L"  --attestation-session <id>    reserved server session id (32 hex)\n"
@@ -205,6 +212,35 @@ static bool ac_print_attestation_digest(void)
         result.observed_mapped_sha256,
         result.mapped_matches_disk ? "true" : "false");
     return result.mapped_matches_disk;
+}
+
+static bool ac_wide_hex_bytes(const wchar_t *text, uint8_t *bytes, size_t count)
+{
+    size_t index;
+
+    if (text == NULL || wcslen(text) != count * 2u) {
+        return false;
+    }
+    for (index = 0; index < count * 2u; ++index) {
+        const wchar_t value = text[index];
+        uint8_t digit;
+
+        if (value >= L'0' && value <= L'9') {
+            digit = (uint8_t)(value - L'0');
+        } else if (value >= L'a' && value <= L'f') {
+            digit = (uint8_t)(value - L'a' + 10);
+        } else if (value >= L'A' && value <= L'F') {
+            digit = (uint8_t)(value - L'A' + 10);
+        } else {
+            return false;
+        }
+        if ((index & 1u) == 0) {
+            bytes[index / 2u] = (uint8_t)(digit << 4u);
+        } else {
+            bytes[index / 2u] = (uint8_t)(bytes[index / 2u] | digit);
+        }
+    }
+    return true;
 }
 
 static bool ac_wide_hex_length(const wchar_t *text, size_t length)
@@ -337,6 +373,21 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
             options->manifest_path = argv[++index];
         } else if (wcscmp(argument, L"--manifest-sha256") == 0 && has_value) {
             options->manifest_sha256 = argv[++index];
+        } else if (wcscmp(argument, L"--manifest-public-key") == 0 && has_value) {
+            if (options->manifest_public_key_count >= AC_MANIFEST_ENVELOPE_MAX_KEYS ||
+                !ac_wide_hex_bytes(
+                    argv[++index],
+                    options->manifest_public_keys[options->manifest_public_key_count],
+                    AC_ED25519_PUBLIC_KEY_SIZE)) {
+                return false;
+            }
+            ++options->manifest_public_key_count;
+        } else if (wcscmp(argument, L"--manifest-min-sequence") == 0 && has_value) {
+            if (!ac_parse_u64(argv[++index], 1u, 9223372036854775807ull, &number)) {
+                return false;
+            }
+            options->manifest_min_sequence = number;
+            options->manifest_min_sequence_set = true;
         } else if (wcscmp(argument, L"--require-manifest") == 0) {
             options->require_manifest = true;
         } else if (wcscmp(argument, L"--attestation-challenge") == 0 &&
@@ -419,7 +470,10 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
 
     if (options->interval_min_ms > options->interval_max_ms ||
         (options->manifest_path == NULL) !=
-            (options->manifest_sha256 == NULL) ||
+            (options->manifest_sha256 == NULL &&
+             options->manifest_public_key_count == 0) ||
+        (options->manifest_min_sequence_set &&
+         options->manifest_public_key_count == 0) ||
         (options->require_manifest && options->manifest_path == NULL) ||
         (options->attestation_challenge == NULL) !=
             (options->attestation_nonce == NULL) ||
@@ -793,7 +847,69 @@ int wmain(int argc, wchar_t **argv)
             "\"freshness_proof\":false}");
     }
 
-    if (options->manifest_path != NULL) {
+    if (options->manifest_path != NULL &&
+        options->manifest_public_key_count != 0) {
+        AcManifestTrust trust;
+
+        trust.expected_sha256 = options->manifest_sha256;
+        trust.public_keys =
+            (const uint8_t (*)[AC_ED25519_PUBLIC_KEY_SIZE])options->manifest_public_keys;
+        trust.public_key_count = options->manifest_public_key_count;
+        trust.minimum_sequence = options->manifest_min_sequence;
+        trust.now_unix = (uint64_t)_time64(NULL);
+        if (!ac_manifest_load_signed(&manifest, options->manifest_path, &trust)) {
+            char rejection_details[192];
+            (void)snprintf(
+                rejection_details,
+                sizeof(rejection_details),
+                "{\"reason\":\"%s\",\"manifest_format\":\"ac-manifest-v2\","
+                "\"minimum_sequence\":%" PRIu64 ",\"trusted_keys\":%zu}",
+                manifest.rejection_reason != NULL
+                    ? manifest.rejection_reason : "unknown",
+                options->manifest_min_sequence,
+                options->manifest_public_key_count);
+            ac_log_event(
+                &logger,
+                AC_SEVERITY_HIGH,
+                "trusted_manifest_rejected",
+                0,
+                rejection_details);
+            if (options->require_manifest) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        } else {
+            char manifest_details[512];
+            manifest_ready = true;
+            (void)snprintf(
+                manifest_details,
+                sizeof(manifest_details),
+                "{\"manifest_sha256\":\"%s\",\"entries\":%zu,"
+                "\"trust_source\":\"%s\","
+                "\"manifest_format\":\"ac-manifest-v2\","
+                "\"application\":\"%s\",\"build_id\":\"%s\","
+                "\"sequence\":%" PRIu64 ",\"not_before\":%" PRIu64 ","
+                "\"not_after\":%" PRIu64 ",\"key_id\":\"%s\","
+                "\"minimum_sequence\":%" PRIu64 "}",
+                manifest.file_sha256,
+                manifest.count,
+                options->manifest_sha256 != NULL
+                    ? "offline_signature_and_hash_pin" : "offline_signature",
+                manifest.envelope.application,
+                manifest.envelope.build_id,
+                manifest.envelope.sequence,
+                manifest.envelope.not_before,
+                manifest.envelope.not_after,
+                manifest.envelope.key_id,
+                options->manifest_min_sequence);
+            ac_log_event(
+                &logger,
+                AC_SEVERITY_INFO,
+                "trusted_manifest_loaded",
+                0,
+                manifest_details);
+        }
+    } else if (options->manifest_path != NULL) {
         if (!ac_manifest_load_pinned(
                 &manifest,
                 options->manifest_path,
@@ -815,7 +931,8 @@ int wmain(int argc, wchar_t **argv)
                 manifest_details,
                 sizeof(manifest_details),
                 "{\"manifest_sha256\":\"%s\",\"entries\":%zu,"
-                "\"trust_source\":\"control_plane_hash_pin\"}",
+                "\"trust_source\":\"control_plane_hash_pin\","
+                "\"manifest_format\":\"ac-manifest-v1\"}",
                 manifest.file_sha256,
                 manifest.count);
             ac_log_event(
