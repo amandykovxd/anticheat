@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -765,6 +768,57 @@ class SpoolTests(unittest.TestCase):
         self._write_records(records[2:])
         second = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
         self.assertEqual(second.records, 2)
+
+    def test_wide_windows_file_ids_are_tracked_exactly(self) -> None:
+        # Python 3.12+ on Windows reports 128-bit ReFS file IDs through st_ino.
+        real_stat = Path.stat
+
+        def wide_stat(path: Path, *arguments: Any, **keywords: Any) -> Any:
+            status = real_stat(path, *arguments, **keywords)
+            return SimpleNamespace(
+                st_dev=status.st_dev,
+                st_ino=status.st_ino + 2**127,
+                st_size=status.st_size,
+                st_mode=status.st_mode,
+            )
+
+        _, records = make_session_records(4)
+        self._write_records(records[:2])
+        with mock.patch.object(Path, "stat", wide_stat):
+            spool = TransportSpool(
+                self.database, self.log, "collector", 1024 * 1024, 3600
+            )
+            first = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
+            self.log.rename(Path(f"{self.log}.1"))
+            self._write_records(records[2:])
+            second = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
+        self.assertEqual((first.records, second.records), (2, 2))
+
+    def test_legacy_integer_cursor_is_migrated(self) -> None:
+        _, records = make_session_records(2)
+        self._write_records(records)
+        status = self.log.stat()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE source_cursor (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    source_path TEXT NOT NULL,
+                    device INTEGER NOT NULL,
+                    inode INTEGER NOT NULL,
+                    byte_offset INTEGER NOT NULL,
+                    active_local_session_id TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO source_cursor VALUES (1, ?, ?, ?, 0, NULL)",
+                (str(self.log.resolve()), status.st_dev, status.st_ino),
+            )
+            connection.commit()
+        spool = TransportSpool(self.database, self.log, "collector", 1024 * 1024, 3600)
+        result = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
+        self.assertEqual(result.records, 2)
 
     def test_appended_collector_restart_creates_a_new_session(self) -> None:
         _, first = make_session_records(2, 0x11)
