@@ -721,6 +721,120 @@ class CorrelationRulesTests(unittest.TestCase):
         )
 
 
+def make_manifest_records(
+    seed_byte: int, details: dict[str, Any]
+) -> tuple[str, list[bytes]]:
+    seed = (bytes([seed_byte]) * 32).hex()
+    first, chain = make_record(
+        1, "log_segment_opened", {"schema": 5, "chain_seed": seed}, seed
+    )
+    manifest, _ = make_record(2, "trusted_manifest_loaded", details, chain)
+    return seed, [first, manifest]
+
+
+def signed_manifest_details(
+    sequence: int, build_id: str = "ab" * 32, application: str = "game"
+) -> dict[str, Any]:
+    return {
+        "manifest_sha256": "11" * 32,
+        "entries": 3,
+        "trust_source": "offline_signature",
+        "manifest_format": "ac-manifest-v2",
+        "application": application,
+        "build_id": build_id,
+        "sequence": sequence,
+        "not_before": 1_700_000_000,
+        "not_after": 1_900_000_000,
+        "key_id": "56475aa75463474c",
+        "minimum_sequence": 0,
+    }
+
+
+class ManifestLedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / "receiver.sqlite3"
+        self.store = ReceiverStore(self.database)
+        self.next_seed = 0x60
+
+    def deliver(
+        self, details: dict[str, Any], store: ReceiverStore | None = None
+    ) -> str:
+        store = store or self.store
+        seed, records = make_manifest_records(self.next_seed, details)
+        client_session_id = f"{self.next_seed:02x}" * 16
+        self.next_seed += 1
+        _, session = store.create_session(
+            session_request(seed, client_session_id, schema_version=5)
+        )
+        store.append_batch(session["session_id"], batch_request(seed, records))
+        return str(session["session_id"])
+
+    def assert_rejected(self, details: dict[str, Any], code: str) -> None:
+        with self.assertRaises(ReceiverError) as captured:
+            self.deliver(details)
+        self.assertEqual(captured.exception.code, code)
+
+    def test_signed_manifest_identity_is_recorded(self) -> None:
+        session_id = self.deliver(signed_manifest_details(7))
+        state = self.store.session_status(session_id)
+        self.assertEqual(state["manifest_application"], "game")
+        self.assertEqual(state["manifest_sequence"], 7)
+        self.assertEqual(state["manifest_build_id"], "ab" * 32)
+
+    def test_lower_sequence_is_rejected_as_rollback(self) -> None:
+        self.deliver(signed_manifest_details(8, "cd" * 32))
+        self.assert_rejected(signed_manifest_details(7), "manifest_rollback")
+
+    def test_same_sequence_with_different_build_is_a_conflict(self) -> None:
+        self.deliver(signed_manifest_details(7))
+        self.assert_rejected(
+            signed_manifest_details(7, "cd" * 32), "manifest_identity_conflict"
+        )
+
+    def test_collector_restart_with_current_manifest_is_accepted(self) -> None:
+        self.deliver(signed_manifest_details(7))
+        self.deliver(signed_manifest_details(8, "cd" * 32))
+        self.deliver(signed_manifest_details(8, "cd" * 32))
+
+    def test_applications_have_independent_ledgers(self) -> None:
+        self.deliver(signed_manifest_details(9, application="game"))
+        self.deliver(signed_manifest_details(2, application="launcher"))
+
+    def test_ledger_survives_receiver_restart(self) -> None:
+        self.deliver(signed_manifest_details(8))
+        restarted = ReceiverStore(self.database)
+        with self.assertRaises(ReceiverError) as captured:
+            self.deliver(signed_manifest_details(7), restarted)
+        self.assertEqual(captured.exception.code, "manifest_rollback")
+
+    def test_unsigned_manifest_is_not_ledgered(self) -> None:
+        self.deliver(signed_manifest_details(8))
+        session_id = self.deliver(
+            {
+                "manifest_sha256": "11" * 32,
+                "entries": 1,
+                "trust_source": "control_plane_hash_pin",
+                "manifest_format": "ac-manifest-v1",
+            }
+        )
+        self.assertIsNone(self.store.session_status(session_id)["manifest_sequence"])
+
+    def test_malformed_signed_identity_is_rejected(self) -> None:
+        for field, value in (
+            ("application", "../game"),
+            ("sequence", 0),
+            ("sequence", True),
+            ("build_id", "AB" * 32),
+            ("key_id", "xyz"),
+        ):
+            details = signed_manifest_details(7)
+            details[field] = value
+            with self.subTest(field=field, value=value):
+                self.assert_rejected(details, "manifest_identity_invalid")
+
+
 class SpoolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

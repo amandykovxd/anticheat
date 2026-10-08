@@ -33,7 +33,7 @@ Not yet completed:
 - production driver package signing;
 - Driver Verifier and HLK validation;
 - KMDF migration evaluation;
-- server-side manifest sequence ledger and manifest identity in attestation;
+- manifest identity in the attestation response;
 - measured compatibility and false-positive datasets.
 
 ## Milestone 1: kernel build and verification pipeline — partial
@@ -129,10 +129,11 @@ The collector verifies either a control-plane-supplied SHA-256 pin
 applies the manifest to every loader-visible module baseline and the startup
 kernel driver snapshot. The signed format carries the application name, build
 ID, monotonic sequence, and validity window; the collector accepts up to eight
-rotation keys and rejects sequences below the control-plane floor. Remaining:
-a receiver-side sequence ledger, manifest identity inside the attestation
-response, per-file size and path constraints, and Authenticode publisher
-constraints.
+rotation keys and rejects sequences below the control-plane floor. The
+reference receiver keeps a per-application sequence ledger and rejects
+rollback and conflicting build IDs. Remaining: manifest identity inside the
+attestation response, per-file size and path constraints, and Authenticode
+publisher constraints.
 
 Deliverables:
 

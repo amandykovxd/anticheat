@@ -131,6 +131,20 @@ the challenge for exactly one server session, and rejects heartbeat until the
 attestation is anchored. A response containing a different release digest,
 mapped image, nonce, or session replay is rejected.
 
+When a batch contains a `trusted_manifest_loaded` record for an
+`ac-manifest-v2` manifest, the receiver also maintains a per-application
+manifest ledger. It records the application, sequence, and build ID on the
+session (visible through `GET /v1/sessions/{id}`) and keeps the highest
+accepted sequence per application across restarts. A batch is rejected with
+HTTP 409 `manifest_rollback` when its sequence is lower than the highest
+accepted sequence. It is rejected with `manifest_identity_conflict` when an
+already-accepted sequence reappears with a different build ID, or when one
+session reports two different manifests. A malformed signed identity returns
+HTTP 422 `manifest_identity_invalid`. This server-side check complements the
+collector's `--manifest-min-sequence` floor: an endpoint that replays an older
+but still validly signed manifest is detected even if the control-plane floor
+is stale. The rejected batch stays in the shipper spool as evidence.
+
 Session registration includes:
 
 - `protocol_version`;

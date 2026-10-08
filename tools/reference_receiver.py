@@ -61,6 +61,9 @@ ATTESTATION_CHALLENGE_PATH = "/v1/attestations/challenges"
 ATTESTATION_DOMAIN = b"ac-collector-attestation-v2"
 ATTESTATION_CHALLENGE_BYTES = 16
 ATTESTATION_NONCE_BYTES = 32
+SIGNED_MANIFEST_FORMAT = "ac-manifest-v2"
+MANIFEST_APPLICATION_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+MANIFEST_KEY_ID_RE = re.compile(r"[0-9a-f]{16}")
 SESSION_TERMINAL_STATES = frozenset(
     {
         "clean_shutdown",
@@ -209,6 +212,9 @@ class ReceiverStore:
                     "ALTER TABLE sessions ADD COLUMN attestation_challenge_id TEXT"
                 )
             session_migrations = {
+                "manifest_application": "TEXT",
+                "manifest_sequence": "INTEGER",
+                "manifest_build_id": "TEXT",
                 "state": "TEXT NOT NULL DEFAULT 'active'",
                 "state_reason": "TEXT",
                 "heartbeat_deadline_ms": "INTEGER NOT NULL DEFAULT 0",
@@ -258,6 +264,30 @@ class ReceiverStore:
                     "ALTER TABLE attestation_challenges "
                     "ADD COLUMN reserved_session_id TEXT"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manifest_ledger (
+                    application TEXT PRIMARY KEY,
+                    highest_sequence INTEGER NOT NULL,
+                    build_id TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manifest_versions (
+                    application TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    build_id TEXT NOT NULL,
+                    first_session_id TEXT NOT NULL,
+                    first_seen_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (application, sequence)
+                )
+                """
+            )
             CorrelationEngine.initialize(connection)
 
     def create_attestation_challenge(
@@ -627,6 +657,127 @@ class ReceiverStore:
             return HTTPStatus.CREATED, response
 
     @staticmethod
+    def _validate_manifests(
+        connection: sqlite3.Connection,
+        session: sqlite3.Row,
+        records: list[Any],
+        now: int,
+    ) -> None:
+        """Reject signed-manifest rollback and conflicting version identities.
+
+        The collector enforces a control-plane floor; this ledger is the
+        server-side counterpart, so an endpoint replaying an older but still
+        validly signed manifest is detected even when the floor is stale.
+        """
+        for record in records:
+            if record.event != "trusted_manifest_loaded":
+                continue
+            details = record.document.get("details")
+            if (
+                not isinstance(details, dict)
+                or details.get("manifest_format") != SIGNED_MANIFEST_FORMAT
+            ):
+                continue
+            try:
+                application = require_string(
+                    details.get("application"), "details.application", 64
+                )
+                if MANIFEST_APPLICATION_RE.fullmatch(application) is None:
+                    raise ProtocolError("details.application has an invalid format")
+                sequence = require_integer(
+                    details.get("sequence"), "details.sequence", 1
+                )
+                build_id = require_sha256(details.get("build_id"), "details.build_id")
+                key_id = require_string(details.get("key_id"), "details.key_id", 16)
+                if MANIFEST_KEY_ID_RE.fullmatch(key_id) is None:
+                    raise ProtocolError("details.key_id has an invalid format")
+            except ProtocolError as error:
+                raise ReceiverError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "manifest_identity_invalid",
+                    str(error),
+                ) from error
+
+            if session["manifest_application"] is not None and (
+                session["manifest_application"] != application
+                or session["manifest_sequence"] != sequence
+                or session["manifest_build_id"] != build_id
+            ):
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "manifest_identity_conflict",
+                    "the session already reported a different signed manifest",
+                )
+            version = connection.execute(
+                """
+                SELECT build_id FROM manifest_versions
+                 WHERE application = ? AND sequence = ?
+                """,
+                (application, sequence),
+            ).fetchone()
+            if version is not None and not hmac.compare_digest(
+                version["build_id"], build_id
+            ):
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "manifest_identity_conflict",
+                    "this manifest sequence was already accepted with a different build ID",
+                    {"application": application, "sequence": sequence},
+                )
+            ledger = connection.execute(
+                "SELECT * FROM manifest_ledger WHERE application = ?",
+                (application,),
+            ).fetchone()
+            if ledger is not None and sequence < int(ledger["highest_sequence"]):
+                raise ReceiverError(
+                    HTTPStatus.CONFLICT,
+                    "manifest_rollback",
+                    "manifest sequence is below the highest accepted for this application",
+                    {
+                        "application": application,
+                        "sequence": sequence,
+                        "highest_sequence": int(ledger["highest_sequence"]),
+                    },
+                )
+
+            if version is None:
+                connection.execute(
+                    """
+                    INSERT INTO manifest_versions (
+                        application, sequence, build_id,
+                        first_session_id, first_seen_at_ms
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (application, sequence, build_id, session["session_id"], now),
+                )
+            if ledger is None or sequence > int(ledger["highest_sequence"]):
+                connection.execute(
+                    """
+                    INSERT INTO manifest_ledger (
+                        application, highest_sequence, build_id, key_id,
+                        session_id, updated_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(application) DO UPDATE SET
+                        highest_sequence = excluded.highest_sequence,
+                        build_id = excluded.build_id,
+                        key_id = excluded.key_id,
+                        session_id = excluded.session_id,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (application, sequence, build_id, key_id, session["session_id"], now),
+                )
+            connection.execute(
+                """
+                UPDATE sessions
+                   SET manifest_application = ?, manifest_sequence = ?,
+                       manifest_build_id = ?
+                 WHERE session_id = ?
+                """,
+                (application, sequence, build_id, session["session_id"]),
+            )
+            session = ReceiverStore._load_session(connection, session["session_id"])
+
+    @staticmethod
     def _load_session(
         connection: sqlite3.Connection, session_id: str
     ) -> sqlite3.Row:
@@ -752,6 +903,8 @@ class ReceiverStore:
                 )
 
             self._validate_attestations(connection, session, verified, now)
+            session = self._load_session(connection, session_id)
+            self._validate_manifests(connection, session, verified, now)
             session = self._load_session(connection, session_id)
             CorrelationEngine.retain_and_correlate(
                 connection, session, verified, now
@@ -939,6 +1092,9 @@ class ReceiverStore:
                 "attestation_required": row["collector_id"] in self.trusted_collectors,
                 "attestation_verified": bool(row["attestation_verified"]),
                 "attestation_challenge_id": row["attestation_challenge_id"],
+                "manifest_application": row["manifest_application"],
+                "manifest_sequence": row["manifest_sequence"],
+                "manifest_build_id": row["manifest_build_id"],
                 "state": row["state"],
                 "state_reason": row["state_reason"],
                 "heartbeat_deadline_ms": row["heartbeat_deadline_ms"],

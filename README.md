@@ -149,8 +149,8 @@ Linux builds register 37 cases: 29 portable cases, 3 Linux collector
 contracts, one suspicious-mapping test, one process-audit test, and the
 transport, manifest-signing, and watchdog suites.
 The transport CTest entry contains
-42 protocol, attestation, correlation, persistence, file-identity, tamper,
-authentication, rotation, and backpressure
+50 protocol, attestation, manifest-ledger, correlation, persistence,
+file-identity, tamper, authentication, rotation, and backpressure
 tests. The watchdog entry contains 11 process identity, restart, terminal-state,
 and failure-recovery tests.
 
