@@ -769,22 +769,27 @@ class SpoolTests(unittest.TestCase):
         second = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
         self.assertEqual(second.records, 2)
 
-    def test_wide_windows_file_ids_are_tracked_exactly(self) -> None:
-        # Python 3.12+ on Windows reports 128-bit ReFS file IDs through st_ino.
+    @staticmethod
+    def _patched_identity(device: int | None, inode_offset: int, inode: int | None = None) -> Any:
+        """Patch Path.stat so file identities are deterministic across hosts."""
         real_stat = Path.stat
 
-        def wide_stat(path: Path, *arguments: Any, **keywords: Any) -> Any:
+        def patched(path: Path, *arguments: Any, **keywords: Any) -> Any:
             status = real_stat(path, *arguments, **keywords)
             return SimpleNamespace(
-                st_dev=status.st_dev,
-                st_ino=status.st_ino + 2**127,
+                st_dev=status.st_dev if device is None else device,
+                st_ino=(status.st_ino if inode is None else inode) + inode_offset,
                 st_size=status.st_size,
                 st_mode=status.st_mode,
             )
 
+        return mock.patch.object(Path, "stat", patched)
+
+    def test_wide_windows_file_ids_are_tracked_exactly(self) -> None:
+        # Python 3.12+ on Windows reports 128-bit ReFS file IDs through st_ino.
         _, records = make_session_records(4)
         self._write_records(records[:2])
-        with mock.patch.object(Path, "stat", wide_stat):
+        with self._patched_identity(None, 2**127):
             spool = TransportSpool(
                 self.database, self.log, "collector", 1024 * 1024, 3600
             )
@@ -795,9 +800,9 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual((first.records, second.records), (2, 2))
 
     def test_legacy_integer_cursor_is_migrated(self) -> None:
+        # The legacy schema only ever stored identities that fit SQLite INTEGER.
         _, records = make_session_records(2)
         self._write_records(records)
-        status = self.log.stat()
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
                 """
@@ -812,12 +817,15 @@ class SpoolTests(unittest.TestCase):
                 """
             )
             connection.execute(
-                "INSERT INTO source_cursor VALUES (1, ?, ?, ?, 0, NULL)",
-                (str(self.log.resolve()), status.st_dev, status.st_ino),
+                "INSERT INTO source_cursor VALUES (1, ?, 7, 42, 0, NULL)",
+                (str(self.log.resolve()),),
             )
             connection.commit()
-        spool = TransportSpool(self.database, self.log, "collector", 1024 * 1024, 3600)
-        result = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
+        with self._patched_identity(7, 0, inode=42):
+            spool = TransportSpool(
+                self.database, self.log, "collector", 1024 * 1024, 3600
+            )
+            result = spool.ingest_available(batch_records=8, batch_bytes=64 * 1024)
         self.assertEqual(result.records, 2)
 
     def test_appended_collector_restart_creates_a_new_session(self) -> None:
