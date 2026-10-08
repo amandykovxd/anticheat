@@ -760,7 +760,8 @@ is `control_plane_hash_pin`. For `ac-manifest-v2` it is `offline_signature` or
 `build_id`, `sequence`, `not_before`, `not_after`, the signing `key_id`, and
 the `minimum_sequence` enforced by the collector. The server should reject a
 session whose `sequence` is lower than the highest sequence it has accepted for
-the same application.
+the same application; `tools/reference_receiver.py` implements this as the
+manifest ledger described in [transport-integration.md](transport-integration.md).
 
 `trusted_manifest_rejected` is `high`. A signed manifest rejection carries
 `reason`, `manifest_format`, `minimum_sequence`, and `trusted_keys`; `reason`
