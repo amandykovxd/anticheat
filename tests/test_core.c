@@ -1287,6 +1287,145 @@ static void test_manifest_rejects_duplicate_entry(void)
     (void)_wremove(path);
 }
 
+/* Signed with tools/manifest_tool.py using the deterministic seed 00..1f. */
+static const char g_signed_manifest_key[] =
+    "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+static const char g_signed_manifest[] =
+    "ac-manifest-v2\n"
+    "application test-app\n"
+    "build-id cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc"
+    "dcdcdcd\n"
+    "sequence 5\n"
+    "not-before 1700000000\n"
+    "not-after 1900000000\n"
+    "module 00000000000000000000000000000000000000000000000000000000000"
+    "00000 test.dll\n"
+    "driver fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "fffff test.sys\n"
+    "signature ed25519 56475aa75463474c 825efdbb90d9c3d5c0031ffdcf022ba"
+    "cd0efe9039a402dd3264f97a68c436db17b4d308af2e0aa570f89c76533cb69f55"
+    "190c8a84a1e73f463a33601b48afb05\n";
+/* Valid signature, but the entries collide under Windows case folding. */
+static const char g_signed_manifest_case_duplicate[] =
+    "ac-manifest-v2\n"
+    "application test-app\n"
+    "build-id cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc"
+    "dcdcdcd\n"
+    "sequence 5\n"
+    "not-before 1700000000\n"
+    "not-after 1900000000\n"
+    "module 00000000000000000000000000000000000000000000000000000000000"
+    "00000 test.dll\n"
+    "module fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "fffff TEST.DLL\n"
+    "signature ed25519 56475aa75463474c a37c84d99d5af27b7c7d981c2beecfa"
+    "2011b0113608d7ac3e4222b0bf9857205a3ca5570bb8082b70823da09751bebf2f"
+    "cdc27b0cbc5e953e01a06a77bf89c03\n";
+
+static void ac_test_signed_trust(
+    AcManifestTrust *trust,
+    uint8_t key[1][AC_ED25519_PUBLIC_KEY_SIZE])
+{
+    size_t index;
+
+    for (index = 0; index < AC_ED25519_PUBLIC_KEY_SIZE; ++index) {
+        unsigned int value = 0;
+        (void)sscanf(g_signed_manifest_key + index * 2u, "%2x", &value);
+        key[0][index] = (uint8_t)value;
+    }
+    memset(trust, 0, sizeof(*trust));
+    trust->public_keys = (const uint8_t (*)[AC_ED25519_PUBLIC_KEY_SIZE])key;
+    trust->public_key_count = 1u;
+    trust->minimum_sequence = 5u;
+    trust->now_unix = 1800000000u;
+}
+
+static void test_manifest_signed_load_and_match(void)
+{
+    AcManifest manifest;
+    AcManifestTrust trust;
+    uint8_t key[1][AC_ED25519_PUBLIC_KEY_SIZE];
+    wchar_t path[MAX_PATH];
+    wchar_t pin[AC_SHA256_HEX_SIZE];
+    char digest[AC_SHA256_HEX_SIZE];
+    uint8_t zero_digest[AC_SHA256_DIGEST_SIZE];
+    uint64_t size = 0;
+
+    ac_manifest_init(&manifest);
+    memset(zero_digest, 0, sizeof(zero_digest));
+    ac_test_signed_trust(&trust, key);
+    AC_CHECK(ac_temp_log_path(path, MAX_PATH, L"ac-manifest-signed"));
+    AC_CHECK(ac_test_write_text_file(path, g_signed_manifest));
+    AC_CHECK(ac_hash_file(path, digest, &size));
+    ac_test_ascii_pin_to_wide(digest, pin);
+
+    AC_CHECK(ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(manifest.trusted && manifest.signed_envelope);
+    AC_CHECK(manifest.count == 2u);
+    AC_CHECK(manifest.envelope.sequence == 5u);
+    AC_CHECK(strcmp(manifest.envelope.application, "test-app") == 0);
+    AC_CHECK(strcmp(manifest.envelope.key_id, "56475aa75463474c") == 0);
+    AC_CHECK(strcmp(manifest.file_sha256, digest) == 0);
+    AC_CHECK(ac_manifest_match(
+        &manifest,
+        AC_MANIFEST_MODULE,
+        L"C:\\game\\TEST.dll",
+        zero_digest) == AC_MANIFEST_AUTHORIZED);
+
+    /* The optional control-plane pin is enforced in addition to the signature. */
+    trust.expected_sha256 = pin;
+    AC_CHECK(ac_manifest_load_signed(&manifest, path, &trust));
+    pin[0] = pin[0] == L'0' ? L'1' : L'0';
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(!manifest.trusted && manifest.count == 0u);
+    AC_CHECK(strcmp(manifest.rejection_reason, "hash_pin_mismatch") == 0);
+    ac_manifest_free(&manifest);
+    (void)_wremove(path);
+}
+
+static void test_manifest_signed_rejections(void)
+{
+    AcManifest manifest;
+    AcManifestTrust trust;
+    uint8_t key[1][AC_ED25519_PUBLIC_KEY_SIZE];
+    wchar_t path[MAX_PATH];
+
+    ac_manifest_init(&manifest);
+    ac_test_signed_trust(&trust, key);
+    AC_CHECK(ac_temp_log_path(path, MAX_PATH, L"ac-manifest-signed-reject"));
+    AC_CHECK(ac_test_write_text_file(path, g_signed_manifest));
+
+    trust.now_unix = 1900000000u;
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(strcmp(manifest.rejection_reason, "expired") == 0);
+    trust.now_unix = 1800000000u;
+
+    trust.minimum_sequence = 6u;
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(strcmp(manifest.rejection_reason, "rollback") == 0);
+    trust.minimum_sequence = 5u;
+
+    key[0][0] = (uint8_t)(key[0][0] ^ 0x01u);
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(strcmp(manifest.rejection_reason, "unknown_key") == 0);
+    key[0][0] = (uint8_t)(key[0][0] ^ 0x01u);
+
+    /* A v1 document is not accepted when signature trust is configured. */
+    AC_CHECK(ac_test_write_text_file(
+        path,
+        "ac-manifest-v1\n"
+        "module 0000000000000000000000000000000000000000000000000000000000000000 test.dll\n"));
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(strcmp(manifest.rejection_reason, "malformed") == 0);
+
+    AC_CHECK(ac_test_write_text_file(path, g_signed_manifest_case_duplicate));
+    AC_CHECK(!ac_manifest_load_signed(&manifest, path, &trust));
+    AC_CHECK(strcmp(manifest.rejection_reason, "entry_rejected") == 0);
+    AC_CHECK(!manifest.trusted && manifest.count == 0u);
+    ac_manifest_free(&manifest);
+    (void)_wremove(path);
+}
+
 static void test_integrity_reports_manifest_violation(void)
 {
     AcIntegrityFixture fixture;
@@ -1504,6 +1643,8 @@ static const AcCoreTestCase g_test_cases[] = {
     {"manifest_pinned_load", test_manifest_pinned_load_and_match},
     {"manifest_wrong_pin", test_manifest_rejects_wrong_pin},
     {"manifest_duplicate", test_manifest_rejects_duplicate_entry},
+    {"manifest_signed_load", test_manifest_signed_load_and_match},
+    {"manifest_signed_rejections", test_manifest_signed_rejections},
     {"manifest_integrity_violation", test_integrity_reports_manifest_violation},
     {"threat_process_indicators", test_threat_process_indicators},
     {"threat_device_indicators", test_threat_device_indicators},

@@ -753,10 +753,22 @@ manifest. Directory membership alone is not a trust decision.
 
 ### Trusted manifest events
 
-`trusted_manifest_loaded` records the control-plane-pinned manifest SHA-256
-and entry count. `trusted_manifest_rejected` is `high` when parsing or pin
-verification fails. `trusted_manifest_unavailable` is `medium` because module
-and driver identity remains telemetry rather than authorization.
+`trusted_manifest_loaded` records the manifest SHA-256, entry count,
+`manifest_format`, and `trust_source`. For `ac-manifest-v1` the trust source
+is `control_plane_hash_pin`. For `ac-manifest-v2` it is `offline_signature` or
+`offline_signature_and_hash_pin`, and the record also contains `application`,
+`build_id`, `sequence`, `not_before`, `not_after`, the signing `key_id`, and
+the `minimum_sequence` enforced by the collector. The server should reject a
+session whose `sequence` is lower than the highest sequence it has accepted for
+the same application.
+
+`trusted_manifest_rejected` is `high`. A signed manifest rejection carries
+`reason`, `manifest_format`, `minimum_sequence`, and `trusted_keys`; `reason`
+is one of `malformed`, `unknown_key`, `bad_signature`, `not_yet_valid`,
+`expired`, `rollback`, `entry_rejected`, `hash_pin_mismatch`, `unreadable`, or
+`invalid_trust_configuration`. An unsigned manifest rejection carries the
+Win32 error. `trusted_manifest_unavailable` is `medium` because module and
+driver identity remains telemetry rather than authorization.
 
 `module_manifest_violation` and `kernel_driver_manifest_violation` are `high`
 when an observed file is absent from the pinned manifest or its SHA-256 does

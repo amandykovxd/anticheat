@@ -24,6 +24,8 @@ Implemented:
 - WDK NuGet restore and x64 driver CI artifact;
 - authenticated transport, bounded spool, heartbeat, and remote chain anchors;
 - control-plane-pinned module and driver manifest enforcement;
+- Ed25519-signed `ac-manifest-v2` with build ID, validity window, key
+  rotation, and a control-plane rollback floor;
 - PE section, IAT, EAT, configured function-pointer, and VMT validation.
 
 Not yet completed:
@@ -31,7 +33,7 @@ Not yet completed:
 - production driver package signing;
 - Driver Verifier and HLK validation;
 - KMDF migration evaluation;
-- offline public-key manifest signatures, expiry, and rollback protection;
+- server-side manifest sequence ledger and manifest identity in attestation;
 - measured compatibility and false-positive datasets.
 
 ## Milestone 1: kernel build and verification pipeline — partial
@@ -122,11 +124,15 @@ Acceptance criteria:
 
 ## Milestone 5: signed application manifest — partial
 
-The current collector verifies a control-plane-supplied SHA-256 pin and applies
-the manifest to every loader-visible module baseline and the startup kernel
-driver snapshot. The remaining work below adds portable offline signature and
-rollback semantics; a local file containing both manifest and pin is not an
-acceptable trust anchor.
+The collector verifies either a control-plane-supplied SHA-256 pin
+(`ac-manifest-v1`) or an offline Ed25519 signature (`ac-manifest-v2`) and
+applies the manifest to every loader-visible module baseline and the startup
+kernel driver snapshot. The signed format carries the application name, build
+ID, monotonic sequence, and validity window; the collector accepts up to eight
+rotation keys and rejects sequences below the control-plane floor. Remaining:
+a receiver-side sequence ledger, manifest identity inside the attestation
+response, per-file size and path constraints, and Authenticode publisher
+constraints.
 
 Deliverables:
 

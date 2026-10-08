@@ -1,4 +1,6 @@
 #include "dedup.h"
+#include "ed25519.h"
+#include "manifest_envelope.h"
 #include "pe.h"
 #include "ranges.h"
 #include "schedule.h"
@@ -716,6 +718,463 @@ static void test_schedule_fair_windows(void)
     AC_CHECK(visited[128]); /* A high-address payload after 128 decoys is visited. */
 }
 
+static uint8_t ac_test_nibble(char value)
+{
+    if (value >= '0' && value <= '9') {
+        return (uint8_t)(value - '0');
+    }
+    AC_CHECK(value >= 'a' && value <= 'f');
+    return (uint8_t)(value - 'a' + 10);
+}
+
+static void ac_test_hex(const char *text, uint8_t *bytes, size_t count)
+{
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        bytes[index] = (uint8_t)((ac_test_nibble(text[index * 2u]) << 4u) |
+                                 ac_test_nibble(text[index * 2u + 1u]));
+    }
+}
+
+static bool ac_test_sha512_matches(const void *data, size_t length, const char *expected)
+{
+    uint8_t digest[AC_SHA512_DIGEST_SIZE];
+    uint8_t wanted[AC_SHA512_DIGEST_SIZE];
+
+    ac_sha512(data, length, digest);
+    ac_test_hex(expected, wanted, sizeof(wanted));
+    return memcmp(digest, wanted, sizeof(digest)) == 0;
+}
+
+static void test_sha512_vectors(void)
+{
+    static const char two_block[] =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+        "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    AcSha512 context;
+    uint8_t digest[AC_SHA512_DIGEST_SIZE];
+    uint8_t wanted[AC_SHA512_DIGEST_SIZE];
+    uint8_t chunk[1000];
+    unsigned int iteration;
+
+    AC_CHECK(ac_test_sha512_matches(
+        "",
+        0u,
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+        "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"));
+    AC_CHECK(ac_test_sha512_matches(
+        two_block,
+        sizeof(two_block) - 1u,
+        "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
+        "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"));
+
+    memset(chunk, 'a', sizeof(chunk));
+    ac_sha512_init(&context);
+    for (iteration = 0; iteration < 1000u; ++iteration) {
+        ac_sha512_update(&context, chunk, sizeof(chunk));
+    }
+    ac_sha512_final(&context, digest);
+    ac_test_hex(
+        "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb"
+        "de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+        wanted,
+        sizeof(wanted));
+    AC_CHECK(memcmp(digest, wanted, sizeof(digest)) == 0);
+}
+
+static void test_ed25519_rfc8032(void)
+{
+    static const struct {
+        const char *public_key;
+        const char *message;
+        const char *signature;
+    } vectors[] = {
+        {
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "",
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        },
+        {
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "72",
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+        },
+        {
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+            "af82",
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+            "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"
+        }
+    };
+    size_t index;
+
+    for (index = 0; index < sizeof(vectors) / sizeof(vectors[0]); ++index) {
+        uint8_t public_key[AC_ED25519_PUBLIC_KEY_SIZE];
+        uint8_t signature[AC_ED25519_SIGNATURE_SIZE];
+        uint8_t message[2];
+        const size_t message_length = strlen(vectors[index].message) / 2u;
+
+        ac_test_hex(vectors[index].public_key, public_key, sizeof(public_key));
+        ac_test_hex(vectors[index].signature, signature, sizeof(signature));
+        ac_test_hex(vectors[index].message, message, message_length);
+        AC_CHECK(ac_ed25519_verify(signature, message, message_length, public_key));
+
+        signature[0] = (uint8_t)(signature[0] ^ 0x01u);
+        AC_CHECK(!ac_ed25519_verify(signature, message, message_length, public_key));
+        signature[0] = (uint8_t)(signature[0] ^ 0x01u);
+        signature[40] = (uint8_t)(signature[40] ^ 0x80u);
+        AC_CHECK(!ac_ed25519_verify(signature, message, message_length, public_key));
+        signature[40] = (uint8_t)(signature[40] ^ 0x80u);
+        if (message_length != 0) {
+            message[0] = (uint8_t)(message[0] ^ 0x01u);
+            AC_CHECK(!ac_ed25519_verify(signature, message, message_length, public_key));
+            message[0] = (uint8_t)(message[0] ^ 0x01u);
+        }
+        public_key[3] = (uint8_t)(public_key[3] ^ 0x10u);
+        AC_CHECK(!ac_ed25519_verify(signature, message, message_length, public_key));
+    }
+}
+
+static void test_ed25519_rejects_malleable_scalar(void)
+{
+    /* Adding the group order L to S yields an equivalent but non-canonical signature. */
+    static const uint8_t order[32] = {
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+        0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
+    };
+    uint8_t public_key[AC_ED25519_PUBLIC_KEY_SIZE];
+    uint8_t signature[AC_ED25519_SIGNATURE_SIZE];
+    unsigned int carry = 0;
+    size_t index;
+
+    ac_test_hex(
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        public_key,
+        sizeof(public_key));
+    ac_test_hex(
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+        "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+        signature,
+        sizeof(signature));
+    for (index = 0; index < 32u; ++index) {
+        const unsigned int sum = signature[32u + index] + order[index] + carry;
+        signature[32u + index] = (uint8_t)sum;
+        carry = sum >> 8u;
+    }
+    AC_CHECK(carry == 0u);
+    AC_CHECK(!ac_ed25519_verify(signature, NULL, 0u, public_key));
+    AC_CHECK(!ac_ed25519_verify(signature, NULL, 1u, public_key));
+}
+
+/* Fixtures signed with tools/manifest_tool.py using seeds 00..1f (A) and 20..3f (B). */
+static const char g_manifest_key_a[] =
+    "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+static const char g_manifest_key_b[] =
+    "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7";
+
+static const char g_manifest_v2_key_a[] =
+    "ac-manifest-v2\n"
+    "application game\n"
+    "build-id ababababababababababababababababababababababababababababa"
+    "bababab\n"
+    "sequence 7\n"
+    "not-before 1700000000\n"
+    "not-after 1900000000\n"
+    "module 11111111111111111111111111111111111111111111111111111111111"
+    "11111 game.exe\n"
+    "module 22222222222222222222222222222222222222222222222222222222222"
+    "22222 client.dll\n"
+    "driver 33333333333333333333333333333333333333333333333333333333333"
+    "33333 AcTelemetry.sys\n"
+    "signature ed25519 56475aa75463474c c4be9ee75ab389b6c6469d503f82c1e"
+    "7e014b7d9d9329d2f570680d891a7d1b3863fde2f6265d87b4aa2f8740603e0439"
+    "39b4785d8dcf3ec39387899bd40f30e\n";
+
+static const char g_manifest_v2_key_b[] =
+    "ac-manifest-v2\n"
+    "application game\n"
+    "build-id ababababababababababababababababababababababababababababa"
+    "bababab\n"
+    "sequence 8\n"
+    "not-before 1700000000\n"
+    "not-after 1900000000\n"
+    "module 11111111111111111111111111111111111111111111111111111111111"
+    "11111 game.exe\n"
+    "signature ed25519 24f6ed6acbfe1009 71806e773139b9ea24efbfe1121bf1b"
+    "d4a09063ae469de715a06433600a31e6f0770da1379be3fd35046409c7db1c8c01"
+    "f94aaefce76a8dcd492449aeba0ba0b\n";
+
+/* Correctly signed, but "sequence 07" is not a canonical decimal. */
+static const char g_manifest_v2_noncanonical[] =
+    "ac-manifest-v2\n"
+    "application game\n"
+    "build-id ababababababababababababababababababababababababababababa"
+    "bababab\n"
+    "sequence 07\n"
+    "not-before 1700000000\n"
+    "not-after 1900000000\n"
+    "module 11111111111111111111111111111111111111111111111111111111111"
+    "11111 game.exe\n"
+    "signature ed25519 56475aa75463474c bbd99cae38bbfa56fb04e096f5a33f5"
+    "770a48dae6a6fc7aab765f003a9aab5dc44a53b4b2d6cb8bb45dc75d8e054cda85"
+    "d91e7d7be3ba51f76df1b13cb914708\n";
+
+typedef struct AcTestManifestSink {
+    size_t modules;
+    size_t drivers;
+    size_t reject_after;
+    bool saw_driver_name;
+    uint8_t first_digest[AC_SHA256_DIGEST_SIZE];
+} AcTestManifestSink;
+
+static bool ac_test_manifest_entry(
+    void *user,
+    AcManifestEnvelopeEntryKind kind,
+    const uint8_t sha256[AC_SHA256_DIGEST_SIZE],
+    const char *file_name)
+{
+    AcTestManifestSink *sink = (AcTestManifestSink *)user;
+    const size_t seen = sink->modules + sink->drivers;
+
+    if (seen == 0) {
+        memcpy(sink->first_digest, sha256, AC_SHA256_DIGEST_SIZE);
+    }
+    if (sink->reject_after != 0 && seen >= sink->reject_after) {
+        return false;
+    }
+    if (kind == AC_MANIFEST_ENVELOPE_DRIVER) {
+        ++sink->drivers;
+        sink->saw_driver_name = strcmp(file_name, "AcTelemetry.sys") == 0;
+    } else {
+        ++sink->modules;
+    }
+    return true;
+}
+
+static AcManifestEnvelopeStatus ac_test_verify_manifest(
+    const char *text,
+    size_t length,
+    const char *const *keys,
+    size_t key_count,
+    uint64_t now,
+    uint64_t minimum_sequence,
+    AcManifestEnvelope *envelope,
+    AcTestManifestSink *sink)
+{
+    uint8_t public_keys[2][AC_ED25519_PUBLIC_KEY_SIZE];
+    AcManifestEnvelopeTrust trust;
+    size_t index;
+
+    for (index = 0; index < key_count && index < 2u; ++index) {
+        ac_test_hex(keys[index], public_keys[index], AC_ED25519_PUBLIC_KEY_SIZE);
+    }
+    trust.public_keys = (const uint8_t (*)[AC_ED25519_PUBLIC_KEY_SIZE])public_keys;
+    trust.key_count = key_count;
+    trust.now_unix = now;
+    trust.minimum_sequence = minimum_sequence;
+    return ac_manifest_envelope_verify(
+        (const uint8_t *)text,
+        length,
+        &trust,
+        envelope,
+        ac_test_manifest_entry,
+        sink);
+}
+
+static void test_manifest_envelope_valid(void)
+{
+    const char *const keys[] = {g_manifest_key_a};
+    AcManifestEnvelope envelope;
+    AcTestManifestSink sink;
+    char key_id[AC_MANIFEST_ENVELOPE_KEY_ID_HEX_SIZE];
+    uint8_t public_key[AC_ED25519_PUBLIC_KEY_SIZE];
+
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a,
+                 sizeof(g_manifest_v2_key_a) - 1u,
+                 keys,
+                 1u,
+                 1800000000u,
+                 7u,
+                 &envelope,
+                 &sink) == AC_MANIFEST_ENVELOPE_OK);
+    AC_CHECK(strcmp(envelope.application, "game") == 0);
+    AC_CHECK(strcmp(
+                 envelope.build_id,
+                 "abababababababababababababababababababababababababababababababab") == 0);
+    AC_CHECK(envelope.sequence == 7u);
+    AC_CHECK(envelope.not_before == 1700000000u);
+    AC_CHECK(envelope.not_after == 1900000000u);
+    AC_CHECK(envelope.entry_count == 3u);
+    AC_CHECK(sink.modules == 2u && sink.drivers == 1u && sink.saw_driver_name);
+    AC_CHECK(sink.first_digest[0] == 0x11u && sink.first_digest[31] == 0x11u);
+
+    ac_test_hex(g_manifest_key_a, public_key, sizeof(public_key));
+    ac_manifest_envelope_key_id(public_key, key_id);
+    AC_CHECK(strcmp(key_id, "56475aa75463474c") == 0);
+    AC_CHECK(strcmp(envelope.key_id, key_id) == 0);
+}
+
+static void test_manifest_envelope_rotation(void)
+{
+    const char *const both[] = {g_manifest_key_a, g_manifest_key_b};
+    const char *const old_only[] = {g_manifest_key_a};
+    AcManifestEnvelope envelope;
+    AcTestManifestSink sink;
+
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_b,
+                 sizeof(g_manifest_v2_key_b) - 1u,
+                 both,
+                 2u,
+                 1800000000u,
+                 7u,
+                 &envelope,
+                 &sink) == AC_MANIFEST_ENVELOPE_OK);
+    AC_CHECK(envelope.sequence == 8u && strcmp(envelope.key_id, "24f6ed6acbfe1009") == 0);
+
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a,
+                 sizeof(g_manifest_v2_key_a) - 1u,
+                 both,
+                 2u,
+                 1800000000u,
+                 0u,
+                 &envelope,
+                 &sink) == AC_MANIFEST_ENVELOPE_OK);
+
+    /* A retired key is removed from the trust set; its successor is unknown. */
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_b,
+                 sizeof(g_manifest_v2_key_b) - 1u,
+                 old_only,
+                 1u,
+                 1800000000u,
+                 0u,
+                 &envelope,
+                 &sink) == AC_MANIFEST_ENVELOPE_UNKNOWN_KEY);
+    AC_CHECK(sink.modules == 0u && envelope.entry_count == 0u);
+}
+
+static void test_manifest_envelope_tamper(void)
+{
+    const char *const keys[] = {g_manifest_key_a};
+    const size_t length = sizeof(g_manifest_v2_key_a) - 1u;
+    const char *digit = strstr(g_manifest_v2_key_a, "module 2");
+    const char *signature = strstr(g_manifest_v2_key_a, "signature ed25519 ");
+    char copy[sizeof(g_manifest_v2_key_a)];
+    AcManifestEnvelope envelope;
+    AcTestManifestSink sink;
+
+    AC_CHECK(digit != NULL && signature != NULL);
+    if (digit == NULL || signature == NULL) {
+        return;
+    }
+
+    memcpy(copy, g_manifest_v2_key_a, sizeof(copy));
+    copy[(size_t)(digit - g_manifest_v2_key_a) + 7u] = '3';
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 copy, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_BAD_SIGNATURE);
+    AC_CHECK(sink.modules == 0u);
+
+    memcpy(copy, g_manifest_v2_key_a, sizeof(copy));
+    copy[length - 2u] = copy[length - 2u] == '0' ? '1' : '0';
+    AC_CHECK(ac_test_verify_manifest(
+                 copy, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_BAD_SIGNATURE);
+
+    /* An uppercase digit is a malformed signature encoding, not a bad signature. */
+    memcpy(copy, g_manifest_v2_key_a, sizeof(copy));
+    copy[length - 2u] = 'E';
+    AC_CHECK(ac_test_verify_manifest(
+                 copy, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_MALFORMED);
+
+    memcpy(copy, g_manifest_v2_key_a, sizeof(copy));
+    copy[(size_t)(signature - g_manifest_v2_key_a) + 18u] = '0';
+    AC_CHECK(ac_test_verify_manifest(
+                 copy, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_UNKNOWN_KEY);
+}
+
+static void test_manifest_envelope_validity(void)
+{
+    const char *const keys[] = {g_manifest_key_a};
+    const size_t length = sizeof(g_manifest_v2_key_a) - 1u;
+    AcManifestEnvelope envelope;
+    AcTestManifestSink sink;
+
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 1u, 1699999999u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_NOT_YET_VALID);
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 1u, 1700000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_OK);
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 1u, 1900000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_EXPIRED);
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 1u, 1800000000u, 8u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_ROLLBACK);
+    AC_CHECK(sink.modules == 0u && sink.drivers == 0u);
+    AC_CHECK(strcmp(ac_manifest_envelope_status_name(AC_MANIFEST_ENVELOPE_ROLLBACK), "rollback") == 0);
+}
+
+static void test_manifest_envelope_malformed(void)
+{
+    const char *const keys[] = {g_manifest_key_a};
+    const size_t length = sizeof(g_manifest_v2_key_a) - 1u;
+    char copy[sizeof(g_manifest_v2_key_a) + 1u];
+    AcManifestEnvelope envelope;
+    AcTestManifestSink sink;
+
+    memset(&sink, 0, sizeof(sink));
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_noncanonical,
+                 sizeof(g_manifest_v2_noncanonical) - 1u,
+                 keys,
+                 1u,
+                 1800000000u,
+                 0u,
+                 &envelope,
+                 &sink) == AC_MANIFEST_ENVELOPE_MALFORMED);
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length - 1u, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_MALFORMED);
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, 0u, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_MALFORMED);
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 0u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_MALFORMED);
+
+    memcpy(copy, g_manifest_v2_key_a, length);
+    copy[14] = '\r';
+    AC_CHECK(ac_test_verify_manifest(
+                 copy, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_MALFORMED);
+
+    memset(&sink, 0, sizeof(sink));
+    sink.reject_after = 2u;
+    AC_CHECK(ac_test_verify_manifest(
+                 g_manifest_v2_key_a, length, keys, 1u, 1800000000u, 0u, &envelope, &sink) ==
+             AC_MANIFEST_ENVELOPE_ENTRY_REJECTED);
+    AC_CHECK(envelope.entry_count == 0u);
+}
+
 typedef void (*AcPortableTestFunction)(void);
 
 typedef struct AcPortableTestCase {
@@ -744,7 +1203,15 @@ static const AcPortableTestCase g_test_cases[] = {
     {"pe_iat_slots", test_pe_enumerates_iat_slots},
     {"pe_malformed_bounds", test_pe_rejects_malformed_input_without_overrun},
     {"pe_rejects_non_pe", test_pe_rejects_non_pe_and_unsupported},
-    {"pe_relocation_bounds", test_pe_relocation_block_loop_is_bounded}
+    {"pe_relocation_bounds", test_pe_relocation_block_loop_is_bounded},
+    {"sha512_vectors", test_sha512_vectors},
+    {"ed25519_rfc8032", test_ed25519_rfc8032},
+    {"ed25519_malleability", test_ed25519_rejects_malleable_scalar},
+    {"manifest_envelope_valid", test_manifest_envelope_valid},
+    {"manifest_envelope_rotation", test_manifest_envelope_rotation},
+    {"manifest_envelope_tamper", test_manifest_envelope_tamper},
+    {"manifest_envelope_validity", test_manifest_envelope_validity},
+    {"manifest_envelope_malformed", test_manifest_envelope_malformed}
 };
 
 int main(int argc, char **argv)

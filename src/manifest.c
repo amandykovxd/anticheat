@@ -128,7 +128,7 @@ static const wchar_t *ac_manifest_base_name(const wchar_t *path)
 static bool ac_manifest_push(
     AcManifest *manifest,
     AcManifestKind kind,
-    const char *digest_text,
+    const uint8_t digest[AC_SHA256_DIGEST_SIZE],
     const char *file_name_utf8)
 {
     AcManifestEntry entry;
@@ -146,9 +146,7 @@ static bool ac_manifest_push(
 
     memset(&entry, 0, sizeof(entry));
     entry.kind = kind;
-    if (!ac_manifest_parse_hex(digest_text, entry.sha256)) {
-        return false;
-    }
+    memcpy(entry.sha256, digest, sizeof(entry.sha256));
     required = MultiByteToWideChar(
         CP_UTF8,
         MB_ERR_INVALID_CHARS,
@@ -241,6 +239,7 @@ bool ac_manifest_load_pinned(
         char *digest_text;
         char *file_name;
         char *extra;
+        uint8_t digest[AC_SHA256_DIGEST_SIZE];
         const size_t length = strlen(line);
         const size_t offset = strspn(line, " \t");
 
@@ -266,14 +265,15 @@ bool ac_manifest_load_pinned(
         file_name = strtok_s(NULL, " \t", &context);
         extra = strtok_s(NULL, " \t", &context);
         if (kind_text == NULL || digest_text == NULL ||
-            file_name == NULL || extra != NULL) {
+            file_name == NULL || extra != NULL ||
+            !ac_manifest_parse_hex(digest_text, digest)) {
             goto fail;
         }
         if (strcmp(kind_text, "module") == 0) {
             if (!ac_manifest_push(
                     manifest,
                     AC_MANIFEST_MODULE,
-                    digest_text,
+                    digest,
                     file_name)) {
                 goto fail;
             }
@@ -281,7 +281,7 @@ bool ac_manifest_load_pinned(
             if (!ac_manifest_push(
                     manifest,
                     AC_MANIFEST_DRIVER,
-                    digest_text,
+                    digest,
                     file_name)) {
                 goto fail;
             }
@@ -306,6 +306,130 @@ fail:
     ac_manifest_free(manifest);
     SetLastError(ERROR_INVALID_DATA);
     return false;
+}
+
+static bool ac_manifest_envelope_entry(
+    void *user,
+    AcManifestEnvelopeEntryKind kind,
+    const uint8_t sha256[AC_SHA256_DIGEST_SIZE],
+    const char *file_name)
+{
+    return ac_manifest_push(
+        (AcManifest *)user,
+        kind == AC_MANIFEST_ENVELOPE_DRIVER
+            ? AC_MANIFEST_DRIVER : AC_MANIFEST_MODULE,
+        sha256,
+        file_name);
+}
+
+static bool ac_manifest_read_bounded(
+    FILE *file,
+    uint8_t **data_out,
+    size_t *size_out)
+{
+    uint8_t *data;
+    size_t size = 0;
+
+    *data_out = NULL;
+    *size_out = 0;
+    /* One extra byte detects documents above the envelope limit. */
+    data = (uint8_t *)malloc(AC_MANIFEST_ENVELOPE_MAX_BYTES + 1u);
+    if (data == NULL) {
+        return false;
+    }
+    for (;;) {
+        const size_t read_count = fread(
+            data + size,
+            1u,
+            AC_MANIFEST_ENVELOPE_MAX_BYTES + 1u - size,
+            file);
+        size += read_count;
+        if (read_count == 0 || size > AC_MANIFEST_ENVELOPE_MAX_BYTES) {
+            break;
+        }
+    }
+    if (ferror(file) || size == 0 || size > AC_MANIFEST_ENVELOPE_MAX_BYTES) {
+        free(data);
+        return false;
+    }
+    *data_out = data;
+    *size_out = size;
+    return true;
+}
+
+bool ac_manifest_load_signed(
+    AcManifest *manifest,
+    const wchar_t *path,
+    const AcManifestTrust *trust)
+{
+    FILE *file;
+    uint8_t *data = NULL;
+    size_t size = 0;
+    uint8_t digest[AC_SHA256_DIGEST_SIZE];
+    char expected[AC_SHA256_HEX_SIZE];
+    char observed[AC_SHA256_HEX_SIZE];
+    AcManifestEnvelopeTrust envelope_trust;
+    AcManifestEnvelopeStatus status;
+
+    if (manifest == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    ac_manifest_free(manifest);
+    if (path == NULL || trust == NULL ||
+        trust->public_keys == NULL || trust->public_key_count == 0 ||
+        trust->public_key_count > AC_MANIFEST_ENVELOPE_MAX_KEYS ||
+        (trust->expected_sha256 != NULL &&
+         !ac_manifest_expected_pin(trust->expected_sha256, expected))) {
+        manifest->rejection_reason = "invalid_trust_configuration";
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+
+    file = _wfsopen(path, L"rb", _SH_DENYWR);
+    if (file == NULL) {
+        manifest->rejection_reason = "unreadable";
+        return false;
+    }
+    if (!ac_manifest_read_bounded(file, &data, &size)) {
+        (void)fclose(file);
+        manifest->rejection_reason = "unreadable";
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+    (void)fclose(file);
+
+    ac_sha256(data, size, digest);
+    ac_sha256_to_hex(digest, observed);
+    if (trust->expected_sha256 != NULL && _stricmp(expected, observed) != 0) {
+        free(data);
+        manifest->rejection_reason = "hash_pin_mismatch";
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+
+    envelope_trust.public_keys = trust->public_keys;
+    envelope_trust.key_count = trust->public_key_count;
+    envelope_trust.now_unix = trust->now_unix;
+    envelope_trust.minimum_sequence = trust->minimum_sequence;
+    status = ac_manifest_envelope_verify(
+        data,
+        size,
+        &envelope_trust,
+        &manifest->envelope,
+        ac_manifest_envelope_entry,
+        manifest);
+    free(data);
+    if (status != AC_MANIFEST_ENVELOPE_OK) {
+        ac_manifest_free(manifest);
+        manifest->rejection_reason = ac_manifest_envelope_status_name(status);
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+    (void)strcpy_s(manifest->file_sha256, sizeof(manifest->file_sha256), observed);
+    manifest->signed_envelope = true;
+    manifest->trusted = true;
+    return true;
 }
 
 AcManifestMatch ac_manifest_match(
